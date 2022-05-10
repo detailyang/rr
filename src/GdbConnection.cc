@@ -360,21 +360,30 @@ static void read_binary_data(const uint8_t* payload, const uint8_t* payload_end,
 static GdbThreadId parse_threadid(const char* str, char** endptr) {
   GdbThreadId t;
   char* endp;
+  bool multiprocess = false;
 
   if ('p' == *str) {
+    multiprocess = true;
     ++str;
   }
   t.pid = strtol(str, &endp, 16);
   parser_assert(endp);
-  if ('\0' == *endp) {
-    t.tid = -1;
-    *endptr = endp;
-    return t;
+
+  /* terminators (single process, no PID or TID, depending on 'p' prefix) */ 
+  if (*endp == '\0' || *endp == ';' || *endp == ',') {
+    if (multiprocess) {
+      t.tid = -1;
+    } else {
+      t.tid = t.pid;
+      t.pid = -1;
+    }
+  /* multiprocess syntax "<pid>.<tid>" */
+  } else if (*endp == '.') {
+    str = endp + 1;
+    t.tid = strtol(str, &endp, 16);
   }
 
-  parser_assert('.' == *endp);
-  str = endp + 1;
-  t.tid = strtol(str, &endp, 16);
+  parser_assert(*endp == '\0' || *endp == ';' || *endp == ',');
 
   *endptr = endp;
   return t;
@@ -399,7 +408,7 @@ void GdbConnection::write_xfer_response(const void* data, size_t size,
 }
 
 static string read_target_desc(const char* file_name) {
-  string path = exe_directory() + "../share/rr/" + string(file_name);
+  string path = resource_path() + "share/rr/" + string(file_name);
   stringstream ss;
   FILE* f = fopen(path.c_str(), "r");
   DEBUG_ASSERT(f);
@@ -419,12 +428,18 @@ static const char* target_description_name(uint32_t cpu_features) {
   switch (cpu_features) {
     case 0:
       return "i386-linux.xml";
-    case GdbConnection::CPU_64BIT:
+    case GdbConnection::CPU_X86_64:
       return "amd64-linux.xml";
     case GdbConnection::CPU_AVX:
       return "i386-avx-linux.xml";
-    case GdbConnection::CPU_64BIT | GdbConnection::CPU_AVX:
+    case GdbConnection::CPU_X86_64 | GdbConnection::CPU_AVX:
       return "amd64-avx-linux.xml";
+    case GdbConnection::CPU_PKU | GdbConnection::CPU_AVX:
+      return "i386-pkeys-linux.xml";
+    case GdbConnection::CPU_X86_64 | GdbConnection::CPU_PKU | GdbConnection::CPU_AVX:
+      return "amd64-pkeys-linux.xml";
+    case GdbConnection::CPU_AARCH64:
+      return "aarch64-core.xml";
     default:
       FATAL() << "Unknown features";
       return nullptr;
@@ -644,6 +659,10 @@ bool GdbConnection::query(char* payload) {
     /* TODO process these */
     LOG(debug) << "gdb supports " << args;
 
+    multiprocess_supported_ = strstr(args, "multiprocess+") != nullptr;
+    hwbreak_supported_ = strstr(args, "hwbreak+") != nullptr;
+    swbreak_supported_ = strstr(args, "swbreak+") != nullptr;
+
     stringstream supported;
     // Encourage gdb to use very large packets since we support any packet size
     supported << "PacketSize=1048576"
@@ -654,7 +673,10 @@ bool GdbConnection::query(char* payload) {
                  ";qXfer:siginfo:read+"
                  ";qXfer:siginfo:write+"
                  ";multiprocess+"
-                 ";ConditionalBreakpoints+";
+                 ";hwbreak+"
+                 ";swbreak+"
+                 ";ConditionalBreakpoints+"
+                 ";vContSupported+";
     if (features().reverse_execution) {
       supported << ";ReverseContinue+"
                    ";ReverseStep+";
@@ -718,7 +740,7 @@ bool GdbConnection::query(char* payload) {
       req.target = query_thread;
       req.mem().addr = strtoul(args, &args, 16);
       parser_assert(';' == *args++);
-      req.mem().len = strtoul(args, &args, 16);
+      req.mem().len = strtoull(args, &args, 16);
       parser_assert(';' == *args++);
       read_binary_data((const uint8_t*)args, inbuf.data() + packetend,
                        req.mem().data);
@@ -939,15 +961,22 @@ bool GdbConnection::process_vpacket(char* payload) {
     string event_str = decode_ascii_encoded_hex_str(arg1);
     char* endp;
     if (event_str[0] == 'c') {
-      int param = strtol(event_str.c_str() + 1, &endp, 0);
+      int64_t param = strtoll(event_str.c_str() + 1, &endp, 0);
       req.restart().type = RESTART_FROM_CHECKPOINT;
       req.restart().param_str = event_str.substr(1);
       req.restart().param = param;
       LOG(debug) << "next replayer restarting from checkpoint "
-                 << req.restart().param;
+                 << param;
+    } else if (event_str[0] == 't') {
+      int64_t param = strtoll(event_str.c_str() + 1, &endp, 0);
+      req.restart().type = RESTART_FROM_TICKS;
+      req.restart().param_str = event_str.substr(1);
+      req.restart().param = param;
+      LOG(debug) << "next replayer restarting from tick count "
+                 << param;
     } else {
       req.restart().type = RESTART_FROM_EVENT;
-      req.restart().param = strtol(event_str.c_str(), &endp, 0);
+      req.restart().param = strtoll(event_str.c_str(), &endp, 0);
       LOG(debug) << "next replayer advancing to event " << req.restart().param;
     }
     if (!endp || *endp != '\0') {
@@ -1057,6 +1086,13 @@ bool GdbConnection::process_packet() {
   switch (request) {
     case 'b':
       ret = process_bpacket(payload);
+      break;
+    case 'c':
+      LOG(debug) << "gdb is asking to continue";
+      req = GdbRequest(DREQ_CONT);
+      req.cont().run_direction = RUN_FORWARD;
+      req.cont().actions.push_back(GdbContAction(ACTION_CONTINUE));
+      ret = true;
       break;
     case 'D':
       LOG(debug) << "gdb is detaching from us";
@@ -1241,7 +1277,7 @@ bool GdbConnection::process_packet() {
 }
 
 void GdbConnection::notify_no_such_thread(const GdbRequest& req) {
-  DEBUG_ASSERT(!memcmp(&req, &this->req, sizeof(this->req)));
+  DEBUG_ASSERT(req.target == this->req.target && req.type == this->req.type);
 
   /* '10' is the errno ECHILD.  We use it as a magic code to
    * notify the user that the thread that was the target of this
@@ -1427,25 +1463,24 @@ static int to_gdb_signum(int sig) {
 }
 
 void GdbConnection::send_stop_reply_packet(GdbThreadId thread, int sig,
-                                           uintptr_t watch_addr) {
+                                           const char *reason) {
   if (sig < 0) {
     write_packet("E01");
     return;
   }
-  char watch[1024];
-  if (watch_addr) {
-    snprintf(watch, sizeof(watch) - 1, "watch:%" PRIxPTR ";", watch_addr);
-  } else {
-    watch[0] = '\0';
-  }
   char buf[PATH_MAX];
-  snprintf(buf, sizeof(buf) - 1, "T%02xthread:p%02x.%02x;%s",
-           to_gdb_signum(sig), thread.pid, thread.tid, watch);
+  if (multiprocess_supported_) {
+    snprintf(buf, sizeof(buf) - 1, "T%02xthread:p%02x.%02x;%s",
+           to_gdb_signum(sig), thread.pid, thread.tid, reason);
+  } else {
+    snprintf(buf, sizeof(buf) - 1, "T%02xthread:%02x;%s",
+           to_gdb_signum(sig), thread.tid, reason);
+  }
   write_packet(buf);
 }
 
 void GdbConnection::notify_stop(GdbThreadId thread, int sig,
-                                uintptr_t watch_addr) {
+                                const char *reason) {
   DEBUG_ASSERT(req.is_resume_request() || req.type == DREQ_INTERRUPT);
 
   if (tgid != thread.pid) {
@@ -1455,7 +1490,11 @@ void GdbConnection::notify_stop(GdbThreadId thread, int sig,
     // the next stop we're willing to tell gdb about.
     return;
   }
-  send_stop_reply_packet(thread, sig, watch_addr);
+
+  if (!reason) {
+    reason = "";
+  }
+  send_stop_reply_packet(thread, sig, reason);
 
   // This isn't documented in the gdb remote protocol, but if we
   // don't do this, gdb will sometimes continue to send requests
@@ -1489,7 +1528,11 @@ void GdbConnection::reply_get_current_thread(GdbThreadId thread) {
   DEBUG_ASSERT(DREQ_GET_CURRENT_THREAD == req.type);
 
   char buf[1024];
-  snprintf(buf, sizeof(buf), "QCp%02x.%02x", thread.pid, thread.tid);
+  if (multiprocess_supported_) {
+    snprintf(buf, sizeof(buf), "QCp%02x.%02x", thread.pid, thread.tid);
+  } else {
+    snprintf(buf, sizeof(buf), "QC%02x", thread.tid);
+  }
   write_packet(buf);
 
   consume_request();
@@ -1608,7 +1651,8 @@ void GdbConnection::reply_get_reg(const GdbRegisterValue& reg) {
 }
 
 void GdbConnection::reply_get_regs(const vector<GdbRegisterValue>& file) {
-  char buf[file.size() * 2 * GdbRegisterValue::MAX_SIZE + 1];
+  std::unique_ptr<char[]> buf(
+      new char[file.size() * 2 * GdbRegisterValue::MAX_SIZE + 1]);
 
   DEBUG_ASSERT(DREQ_GET_REGS == req.type);
 
@@ -1616,7 +1660,7 @@ void GdbConnection::reply_get_regs(const vector<GdbRegisterValue>& file) {
   for (auto& reg : file) {
     offset += print_reg_value(reg, &buf[offset]);
   }
-  write_packet(buf);
+  write_packet(buf.get());
 
   consume_request();
 }
@@ -1640,7 +1684,7 @@ void GdbConnection::reply_set_reg(bool ok) {
 void GdbConnection::reply_get_stop_reason(GdbThreadId which, int sig) {
   DEBUG_ASSERT(DREQ_GET_STOP_REASON == req.type);
 
-  send_stop_reply_packet(which, sig);
+  send_stop_reply_packet(which, sig, "");
 
   consume_request();
 }
@@ -1657,8 +1701,12 @@ void GdbConnection::reply_get_thread_list(const vector<GdbThreadId>& threads) {
       if (tgid != t.pid) {
         continue;
       }
-      sstr << 'p' << setw(2) << setfill('0') << hex << t.pid << dec << '.'
-           << setw(2) << setfill('0') << hex << t.tid << ',';
+      if (multiprocess_supported_) {
+        sstr << 'p' << setw(2) << setfill('0') << hex << t.pid << dec << '.'
+            << setw(2) << setfill('0') << hex << t.tid << ',';
+      } else {
+        sstr << setw(2) << setfill('0') << hex << t.tid << ',';
+      }
     }
 
     string str = sstr.str();

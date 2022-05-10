@@ -12,6 +12,10 @@ int main(void) {
   int* outq;
   struct winsize* w;
   pid_t* sid;
+  int* nread;
+  int sockets[2];
+
+  signal(SIGTTOU, SIG_IGN);
 
   fd = open("/dev/tty", O_RDWR);
   if (fd < 0) {
@@ -56,8 +60,12 @@ int main(void) {
   ALLOCATE_GUARD(pgrp, 'c');
   test_assert(0 == ioctl(fd, TIOCGPGRP, pgrp));
   VERIFY_GUARD(pgrp);
-  atomic_printf("TIOCGPGRP returned process group %d\n", *pgrp);
-  test_assert(0 == ioctl(fd, TIOCSPGRP, pgrp));
+  if (*pgrp != 0) {
+    atomic_printf("TIOCGPGRP returned process group %d\n", *pgrp);
+    test_assert(0 == ioctl(fd, TIOCSPGRP, pgrp));
+  } else {
+    atomic_printf("Skipping TIOCSPGRP test - controlling tty outside PID ns.");
+  }
 
   ALLOCATE_GUARD(navail, 'd');
   test_assert(0 == ioctl(fd, TIOCINQ, navail));
@@ -79,6 +87,12 @@ int main(void) {
   test_assert(0 == ioctl(fd, TIOCGSID, sid));
   VERIFY_GUARD(sid);
   atomic_printf("TIOCGSID returned %d\n", *sid);
+
+  socketpair(AF_UNIX, SOCK_STREAM, 0, sockets);
+  ALLOCATE_GUARD(nread, 'h');
+  test_assert(0 == ioctl(sockets[0], FIONREAD, nread));
+  VERIFY_GUARD(nread);
+  atomic_printf("FIONREAD returned nread=%d\n", *nread);
 
   atomic_puts("EXIT-SUCCESS");
   return 0;

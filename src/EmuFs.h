@@ -25,7 +25,7 @@ class Task;
  * treatment because (i) they were most likely modified during
  * recording, so (ii) the original file contents only exist as
  * snapshots in the trace, but (iii) all mappings of the file must
- * point at the same underling resource, so that modifications are
+ * point at the same underlying resource, so that modifications are
  * seen by all mappees.
  *
  * The rr EmuFs creates "emulated files" in shared memory during
@@ -53,6 +53,23 @@ class Task;
  * disjoint.  And F_0 being GC'd at that point is the important
  * assumption mentioned above.
  */
+
+class EmuFile;
+struct FileId {
+  FileId(const KernelMapping& recorded_map);
+  FileId(const EmuFile& emu_file);
+  FileId(dev_t device, ino_t inode)
+      : device(device), inode(inode) {}
+  bool operator==(const FileId& other) const {
+    return (device == other.device && inode == other.inode);
+  }
+  bool operator<(const FileId& other) const {
+    return device < other.device ||
+            (device == other.device && inode < other.inode);
+  }
+  dev_t device;
+  ino_t inode;
+};
 
 /**
  * A file within an EmuFs.  The file is real, but it's mapped to file
@@ -150,6 +167,12 @@ public:
   EmuFile::shr_ptr get_or_create(const KernelMapping& recorded_km);
 
   /**
+   * Return an already-existing emulated file for the given device/inode.
+   * Returns null if not found.
+   */
+  EmuFile::shr_ptr find(dev_t device, ino_t inode);
+
+  /**
    * Dump information about this emufs to the "error" log.
    */
   void log() const;
@@ -163,18 +186,6 @@ public:
 
 private:
   EmuFs();
-
-  struct FileId {
-    FileId(const KernelMapping& recorded_map);
-    FileId(const EmuFile& emu_file)
-        : device(emu_file.device()), inode(emu_file.inode()) {}
-    bool operator<(const FileId& other) const {
-      return device < other.device ||
-             (device == other.device && inode < other.inode);
-    }
-    dev_t device;
-    ino_t inode;
-  };
 
   typedef std::map<FileId, std::weak_ptr<EmuFile>> FileMap;
 

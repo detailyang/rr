@@ -30,8 +30,7 @@ private:
   struct InternalMark;
 
 public:
-  ReplayTimeline(std::shared_ptr<ReplaySession> session,
-                 const ReplaySession::Flags& session_flags);
+  ReplayTimeline(std::shared_ptr<ReplaySession> session);
   ReplayTimeline() : breakpoints_applied(false) {}
   ~ReplayTimeline();
 
@@ -90,6 +89,7 @@ public:
    * Use ReplayTimeline's breakpoint methods.
    */
   ReplaySession& current_session() { return *current; }
+  const ReplaySession& current_session() const { return *current; }
 
   /**
    * Return a mark for the current state. A checkpoint need not be retained,
@@ -160,7 +160,10 @@ public:
    * at the beginning of this event.
    */
   void set_reverse_execution_barrier_event(FrameTime event) {
-    reverse_execution_barrier_event = event;
+    reverse_execution_barrier_event_ = event;
+  }
+  FrameTime reverse_execution_barrier_event() {
+    return reverse_execution_barrier_event_;
   }
 
   // State-changing APIs. These may alter state associated with
@@ -173,6 +176,11 @@ public:
   void seek_to_before_event(FrameTime time) {
     return seek_to_before_key(MarkKey(time, 0, ReplayStepKey()));
   }
+
+  /**
+   * Seek the timeline to just before tick count `ticks` during event `time`.
+   */
+  void seek_to_ticks(FrameTime time, Ticks ticks);
 
   /**
    * Reset the current session to the last checkpointed session before (or at)
@@ -263,6 +271,7 @@ private:
     MarkKey(FrameTime trace_time, Ticks ticks, ReplayStepKey step_key)
         : trace_time(trace_time), ticks(ticks), step_key(step_key) {}
     MarkKey(const MarkKey& other) = default;
+    MarkKey& operator=(const MarkKey& other) = default;
     FrameTime trace_time;
     Ticks ticks;
     ReplayStepKey step_key;
@@ -451,8 +460,6 @@ private:
    */
   void evaluate_conditions(ReplayResult& result);
 
-  ReplaySession::Flags session_flags;
-
   ReplaySession::shr_ptr current;
   // current is known to be at or after this mark
   std::shared_ptr<InternalMark> current_at_or_after_mark;
@@ -501,7 +508,7 @@ private:
       watchpoints;
   bool breakpoints_applied;
 
-  FrameTime reverse_execution_barrier_event;
+  FrameTime reverse_execution_barrier_event_;
 
   /**
    * Checkpoints used to accelerate reverse execution.

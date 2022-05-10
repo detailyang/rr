@@ -32,8 +32,12 @@ public:
   void init_buffers(remote_ptr<void> map_hint);
   /**
    * Call this method when the exec has completed.
+   * `replay_exe` is the name of the real executable file in the trace if we have one,
+   * otherwise the name of the original executable file. This gets passed to gdb
+   * as a best-effort to give gdb a file to look at.
+   * `original_replay_exe` is the name of the original executable file.
    */
-  void post_exec_syscall(const std::string& replay_exe);
+  void post_exec_syscall(const std::string& replay_exe, const std::string& original_replay_exe);
 
   enum {
     /* The x86 linux 3.5.0-36 kernel packaged with Ubuntu
@@ -67,10 +71,17 @@ public:
    */
   void set_real_tid_and_update_serial(pid_t tid);
 
+  void note_sched_in_syscallbuf_syscall_hook() {
+    seen_sched_in_syscallbuf_syscall_hook = true;
+  }
+
 private:
   template <typename Arch> void init_buffers_arch(remote_ptr<void> map_hint);
 
-  ~ReplayTask() {}
+  virtual bool post_vm_clone(CloneReason reason, int flags, Task* origin);
+
+  // Set to true when we see a sched event with in_syscallbuf_syscall_hook set.
+  bool seen_sched_in_syscallbuf_syscall_hook;
 };
 
 } // namespace rr

@@ -24,7 +24,8 @@ public:
     NONE,
     CLONE, // created by clone(2), fork(2), vfork(2) syscalls
     EXEC,
-    EXIT
+    EXIT,
+    DETACH
   };
 
   TraceTaskEvent(Type type = NONE, pid_t tid = 0) : type_(type), tid_(tid) {}
@@ -50,6 +51,10 @@ public:
     result.exit_status_ = exit_status;
     return result;
   }
+  static TraceTaskEvent for_detach(pid_t tid) {
+    TraceTaskEvent result(DETACH, tid);
+    return result;
+  }
 
   Type type() const { return type_; }
   pid_t tid() const { return tid_; }
@@ -65,6 +70,7 @@ public:
     DEBUG_ASSERT(type() == CLONE);
     return clone_flags_;
   }
+  // Ignores `dirfd` for execveat
   const std::string& file_name() const {
     DEBUG_ASSERT(type() == EXEC);
     return file_name_;

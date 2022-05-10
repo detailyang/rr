@@ -73,11 +73,16 @@ static bool parse_ls_arg(vector<string>& args, LsFlags& flags) {
   return true;
 }
 
-typedef pair<string, unique_ptr<TraceReader>> TraceInfo;
+struct TraceInfo {
+  string name;
+  struct timespec ctime;
 
-static bool compare_by_name(TraceInfo& at, TraceInfo& bt) {
-  auto a = at.first;
-  auto b = bt.first;
+  TraceInfo(string in_name) : name(in_name) {}
+};
+
+static bool compare_by_name(const TraceInfo& at, const TraceInfo& bt) {
+  auto a = at.name;
+  auto b = bt.name;
   return lexicographical_compare(begin(a), end(a), begin(b), end(b));
 }
 
@@ -100,6 +105,7 @@ static bool get_folder_size(string dir_name, string& size_str) {
 
     bytes += st.st_size;
   }
+  closedir(dir);
 
   static const char suffixes[] = " KMGT";
   double size = bytes;
@@ -134,9 +140,9 @@ static bool is_valid_trace(const string& entry) {
   return true;
 }
 
-static string get_exec_path(TraceInfo& info) {
+static string get_exec_path(TraceReader& reader) {
   while (true) {
-    TraceTaskEvent r = info.second->read_task_event();
+    TraceTaskEvent r = reader.read_task_event();
     if (r.type() == TraceTaskEvent::NONE) {
       break;
     }
@@ -160,18 +166,22 @@ static int ls(const string& traces_dir, const LsFlags& flags, FILE* out) {
     if (!is_valid_trace(trace_dir->d_name)) {
       continue;
     }
-    traces.emplace_back(string(trace_dir->d_name), unique_ptr<TraceReader>());
+    traces.emplace_back(TraceInfo(string(trace_dir->d_name)));
+    if (flags.sort_by_time || flags.full_listing) {
+      struct stat st;
+      stat((traces_dir + "/" + trace_dir->d_name + "/data").c_str(), &st);
+      traces.back().ctime = st.st_ctim;
+    }
   }
+  closedir(dir);
 
   if (flags.sort_by_time) {
-    auto compare_by_time = [&](TraceInfo& at, TraceInfo& bt) -> bool {
-      auto a_version = traces_dir + at.first + "/data";
-      auto b_version = traces_dir + bt.first + "/data";
-      struct stat a_stat;
-      struct stat b_stat;
-      stat(a_version.c_str(), &a_stat);
-      stat(b_version.c_str(), &b_stat);
-      return a_stat.st_ctime < b_stat.st_ctime;
+    auto compare_by_time = [&](const TraceInfo& at,
+                               const TraceInfo& bt) -> bool {
+      if (at.ctime.tv_sec == bt.ctime.tv_sec) {
+        return at.ctime.tv_nsec < bt.ctime.tv_nsec;
+      }
+      return at.ctime.tv_sec < bt.ctime.tv_sec;
     };
     sort(traces.begin(), traces.end(), compare_by_time);
   } else {
@@ -184,14 +194,14 @@ static int ls(const string& traces_dir, const LsFlags& flags, FILE* out) {
 
   if (!flags.full_listing) {
     for (TraceInfo& t : traces) {
-      cout << t.first << "\n";
+      cout << t.name << "\n";
     }
     return 0;
   }
 
   int max_name_size =
     accumulate(traces.begin(), traces.end(), 0, [](int m, TraceInfo& t) {
-        return max(m, static_cast<int>(t.first.length()));
+        return max(m, static_cast<int>(t.name.length()));
     });
 
   fprintf(out, "%-*s %-19s %5s %s\n", max_name_size,
@@ -199,22 +209,26 @@ static int ls(const string& traces_dir, const LsFlags& flags, FILE* out) {
 
   for (TraceInfo& t : traces) {
     // Record date & runtime estimates
-    struct stat st;
-    string data_file = traces_dir + "/" + t.first + "/data";
-    stat(data_file.c_str(), &st);
+    string data_file = traces_dir + "/" + t.name + "/data";
     char outstr[200];
-    strftime(outstr, sizeof(outstr), "%F %T", localtime(&st.st_ctime));
+    struct tm ctime_tm;
+    if (localtime_r(&t.ctime.tv_sec, &ctime_tm)) {
+      strftime(outstr, sizeof(outstr), "%F %T", &ctime_tm);
+    } else {
+      strcpy(outstr, "<error>");
+    }
 
     string folder_size = "????";
     string exe = "(incomplete)";
-    string version_file = traces_dir + "/" + t.first + "/version";
+    string version_file = traces_dir + "/" + t.name + "/version";
+    struct stat st;
     if (stat(version_file.c_str(), &st) != -1) {
-      t.second.reset(new TraceReader(traces_dir + "/" + t.first));
-      get_folder_size(t.second->dir(), folder_size);
-      exe = get_exec_path(t);
+      TraceReader reader(traces_dir + "/" + t.name);
+      get_folder_size(reader.dir(), folder_size);
+      exe = get_exec_path(reader);
     }
 
-    fprintf(out, "%-*s %s %5s %s\n", max_name_size, t.first.c_str(),
+    fprintf(out, "%-*s %s %5s %s\n", max_name_size, t.name.c_str(),
             outstr, folder_size.c_str(), exe.c_str());
   }
 
@@ -222,11 +236,6 @@ static int ls(const string& traces_dir, const LsFlags& flags, FILE* out) {
 }
 
 int LsCommand::run(vector<string>& args) {
-  if (getenv("RUNNING_UNDER_RR")) {
-    fprintf(stderr, "rr: cannot run rr replay under rr. Exiting.\n");
-    return 1;
-  }
-
   bool found_dir = false;
   string trace_dir;
   LsFlags flags;

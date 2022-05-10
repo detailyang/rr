@@ -9,9 +9,11 @@
 #include "AddressSpace.h"
 #include "CPUIDBugDetector.h"
 #include "DiversionSession.h"
+#include "TraceStream.h"
 #include "EmuFs.h"
 #include "Session.h"
 #include "Task.h"
+#include "fast_forward.h"
 
 struct syscallbuf_hdr;
 
@@ -25,8 +27,10 @@ class ReplayTask;
  * per-Session data.
  */
 struct ReplayFlushBufferedSyscallState {
-  /* An internal breakpoint is set at this address */
-  uintptr_t stop_breakpoint_addr;
+  /* The offset in the syscallbuf (in 8-byte units) at which we want to stop */
+  uintptr_t stop_breakpoint_offset;
+  /* This includes slop */
+  Ticks recorded_ticks;
 };
 
 /**
@@ -58,6 +62,12 @@ enum ReplayTraceStepType {
   /* Replay until we enter the next syscall, then patch it. */
   TSTEP_PATCH_SYSCALL,
 
+  /* Replay until we exit the next syscall, then patch it. */
+  TSTEP_PATCH_AFTER_SYSCALL,
+
+  /* Replay until we hit the ip recorded in the event, then patch the vsyscall caller. */
+  TSTEP_PATCH_VSYSCALL,
+
   /* Exit the task */
   TSTEP_EXIT_TASK,
 
@@ -84,6 +94,8 @@ struct ReplayTraceStep {
     struct {
       Ticks ticks;
       int signo;
+      // Not remote_code_ptr because this has to have plain data
+      uint64_t in_syscallbuf_syscall_hook;
     } target;
 
     ReplayFlushBufferedSyscallState flush;
@@ -106,6 +118,10 @@ struct ReplayResult {
   // break_status.singlestep_complete might indicate the completion of more
   // than one instruction.
   bool did_fast_forward;
+  // True if we fast-forward-singlestepped a string instruction but it has at least
+  // one iteration to go. did_fast_forward may be false in this case if the
+  // instruction executes exactly twice.
+  bool incomplete_fast_forward;
 };
 
 /**
@@ -207,7 +223,7 @@ public:
    * Returns true if the next step for this session is to exit a syscall with
    * the given number.
    */
-  bool next_step_is_successful_syscall_exit(int syscallno);
+  bool next_step_is_successful_exec_syscall_exit();
 
   /**
    * The current ReplayStepKey.
@@ -220,11 +236,25 @@ public:
     return ticks_at_start_of_event;
   }
 
+  struct Flags {
+    Flags()
+      : redirect_stdio(false)
+      , share_private_mappings(false)
+      , replay_stops_at_first_execve(false)
+      , cpu_unbound(false) {}
+    Flags(const Flags&) = default;
+    bool redirect_stdio;
+    std::string redirect_stdio_file;
+    bool share_private_mappings;
+    bool replay_stops_at_first_execve;
+    bool cpu_unbound;
+  };
+
   /**
    * Create a replay session that will use the trace directory specified
    * by 'dir', or the latest trace if 'dir' is not supplied.
    */
-  static shr_ptr create(const std::string& dir);
+  static shr_ptr create(const std::string& dir, const Flags& flags);
 
   struct StepConstraints {
     explicit StepConstraints(RunCommand command)
@@ -264,6 +294,8 @@ public:
 
   virtual ReplaySession* as_replay() override { return this; }
 
+  SupportedArch arch() { return trace_in.arch(); }
+
   /**
    * Return true if |sig| is a signal that may be generated during
    * replay but should be ignored.  For example, SIGCHLD can be
@@ -275,16 +307,7 @@ public:
    */
   static bool is_ignored_signal(int sig);
 
-  struct Flags {
-    Flags() : redirect_stdio(false), share_private_mappings(false) {}
-    Flags(const Flags& other) = default;
-    bool redirect_stdio;
-    bool share_private_mappings;
-  };
-  bool redirect_stdio() { return flags.redirect_stdio; }
-  bool share_private_mappings() { return flags.share_private_mappings; }
-
-  void set_flags(const Flags& flags) { this->flags = flags; }
+  const Flags& flags() const { return flags_; }
 
   typedef std::set<MemoryRange, MappingComparator> MemoryRanges;
   /**
@@ -297,8 +320,43 @@ public:
 
   virtual TraceStream* trace_stream() override { return &trace_in; }
 
+  virtual int cpu_binding(TraceStream& trace) const override;
+
+  bool has_trace_quirk(TraceReader::TraceQuirks quirk) { return trace_in.quirks() & quirk; }
+
+  virtual int tracee_output_fd(int dflt) override {
+    return tracee_output_fd_.get() ? tracee_output_fd_->get() : dflt;
+  }
+
+  /**
+   * Get ready to detach these tasks and reattach them in a child process. Call this
+   * before forking the child.
+   */
+  void prepare_to_detach_tasks();
+  /**
+   * This ReplaySession is in a forked child. The real ReplaySession is still running in
+   * the parent, so we don't really own tasks and other shared resources. Forget about
+   * them so we don't try to tear them down when this ReplaySession is destroyed.
+   */
+  void forget_tasks();
+  /**
+   * The shared resources associated with this ReplaySession are being transferred to
+   * the child process `new_ptracer`. Prepare them for transfer (e.g. ptrace-detach the
+   * tracees) and prepare them to be traced by `new_ptracer`, and forget about them.
+   * `new_sock_fd` is the new control fd pushed into all tasks.
+   */
+  void detach_tasks(pid_t new_ptracer, ScopedFd& new_tracee_socket_receiver);
+  /**
+   * The shared resources associated with this ReplaySession are being transferred to
+   * the child process `new_ptracer`. Receive them in the child process by ptrace-attaching
+   * to them etc.
+   * `new_sock_fd` is the control fd that has been assigned to all tasks,
+   * `new_sock_receiver_fd` is its receiver end.
+   */
+  void reattach_tasks(ScopedFd new_tracee_socket, ScopedFd new_tracee_socket_receiver);
+
 private:
-  ReplaySession(const std::string& dir);
+  ReplaySession(const std::string& dir, const Flags& flags);
   ReplaySession(const ReplaySession& other);
 
   ReplayTask* revive_task_for_exec();
@@ -325,12 +383,15 @@ private:
                                           const StepConstraints& constraints);
   Completion emulate_async_signal(ReplayTask* t,
                                   const StepConstraints& constraints,
-                                  Ticks ticks);
-  void prepare_syscallbuf_records(ReplayTask* t);
+                                  Ticks ticks,
+                                  remote_code_ptr in_syscallbuf_syscall_hook);
+  void prepare_syscallbuf_records(ReplayTask* t, Ticks ticks);
   Completion flush_syscallbuf(ReplayTask* t,
                               const StepConstraints& constraints);
   Completion patch_next_syscall(ReplayTask* t,
-                                const StepConstraints& constraints);
+                                const StepConstraints& constraints,
+                                bool before_syscall);
+  Completion patch_vsyscall(ReplayTask* t, const StepConstraints& constraints);
   void check_approaching_ticks_target(ReplayTask* t,
                                       const StepConstraints& constraints,
                                       BreakStatus& break_status);
@@ -338,17 +399,19 @@ private:
   void clear_syscall_bp();
 
   std::shared_ptr<EmuFs> emu_fs;
+  std::shared_ptr<ScopedFd> tracee_output_fd_;
   TraceReader trace_in;
   TraceFrame trace_frame;
   ReplayTraceStep current_step;
   Ticks ticks_at_start_of_event;
   CPUIDBugDetector cpuid_bug_detector;
   siginfo_t last_siginfo_;
-  Flags flags;
-  bool did_fast_forward;
+  Flags flags_;
+  FastForwardStatus fast_forward_status;
+  bool skip_next_execution_event;
 
   // The clock_gettime(CLOCK_MONOTONIC) timestamp of the first trace event, used
-  // during 'replay' to calculate the elapsed time between the first event and 
+  // during 'replay' to calculate the elapsed time between the first event and
   // all other recorded events in the timeline during the 'record' phase.
   double trace_start_time;
 

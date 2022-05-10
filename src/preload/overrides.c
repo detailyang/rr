@@ -10,50 +10,101 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
 #include "preload_interface.h"
 #include "syscallbuf.h"
 
-/* Points at the libc/pthread real_pthread_mutex_timedlock().  We wrap
- * real_pthread_mutex_timedlock(), so need to retain this pointer to call
- * out to the libc version. There is no __pthread_mutex_timedlock stub to call.
- * There are some explicitly-versioned stubs but let's not use those. */
-static int (*real_pthread_mutex_timedlock)(pthread_mutex_t* mutex,
+#define PTHREAD_MUTEX_PRIO_INHERIT_NP 32
+
+#define DOUBLE_UNDERSCORE_PTHREAD_LOCK_AVAILABLE 1
+#ifdef __GLIBC_PREREQ
+#if __GLIBC_PREREQ(2, 34)
+#undef DOUBLE_UNDERSCORE_PTHREAD_LOCK_AVAILABLE
+#endif
+#endif
+
+static int (*real_pthread_mutex_init)(void* mutex, const void* attr);
+static int (*real_pthread_mutex_lock)(void* mutex);
+static int (*real_pthread_mutex_trylock)(void* mutex);
+static int (*real_pthread_mutex_timedlock)(void* mutex,
                                            const struct timespec* abstime);
 
-#define PTHREAD_MUTEX_TYPE_MASK 3
-#define PTHREAD_MUTEX_PRIO_INHERIT_NP 32
+static void __attribute__((constructor)) init_override(void) {
+  real_pthread_mutex_init = dlsym(RTLD_NEXT, "pthread_mutex_init");
+  real_pthread_mutex_lock = dlsym(RTLD_NEXT, "pthread_mutex_lock");
+  real_pthread_mutex_trylock = dlsym(RTLD_NEXT, "pthread_mutex_trylock");
+  real_pthread_mutex_timedlock = dlsym(RTLD_NEXT, "pthread_mutex_timedlock");
+}
 
 static void fix_mutex_kind(pthread_mutex_t* mutex) {
   /* Disable priority inheritance. */
   mutex->__data.__kind &= ~PTHREAD_MUTEX_PRIO_INHERIT_NP;
 }
 
+extern int __pthread_mutex_init(pthread_mutex_t* mutex,
+                                const pthread_mutexattr_t* attr);
+#ifdef DOUBLE_UNDERSCORE_PTHREAD_LOCK_AVAILABLE
 /*
- * We bind directly to __pthread_mutex_lock and __pthread_mutex_trylock
- * because setting up indirect function pointers in init_process requires
- * calls to dlsym which itself can call pthread_mutex_lock (e.g. via
- * application code overriding malloc/calloc to use a pthreads-based
- * implementation).
+ * We need to able to call directly to __pthread_mutex_lock and
+ * __pthread_mutex_trylock because setting up indirect function pointers
+ * in init_process requires calls to dlsym which itself can call
+ * pthread_mutex_lock (e.g. via application code overriding malloc/calloc
+ * to use a pthreads-based implementation). So before our pointers are set
+ * up, call these.
  */
 extern int __pthread_mutex_lock(pthread_mutex_t* mutex);
 extern int __pthread_mutex_trylock(pthread_mutex_t* mutex);
+#endif
+
+int pthread_mutex_init(pthread_mutex_t* mutex,
+                       const pthread_mutexattr_t* attr) {
+  int ret;
+  pthread_mutexattr_t realattr;
+
+  if (!attr) {
+    return __pthread_mutex_init(mutex, NULL);
+  }
+
+  /* We wish to enforce the use of plain (no PI) mutex to avoid
+   * needing to handle PI futex() operations.
+   * We also wish to ensure that pthread_mutexattr_getprotocol()
+   * still returns the requested protocol.
+   * So we copy the attribute and force PTHREAD_PRIO_NONE.
+   */
+  memcpy(&realattr, attr, sizeof(realattr));
+  ret = pthread_mutexattr_setprotocol(&realattr, PTHREAD_PRIO_NONE);
+  if (ret) {
+    return ret;
+  }
+  if (real_pthread_mutex_init) {
+    return real_pthread_mutex_init(mutex, &realattr);
+  }
+  return __pthread_mutex_init(mutex, &realattr);
+}
 
 /* Prevent use of lock elision; Haswell's TSX/RTM features used by
    lock elision increment the rbc perf counter for instructions which
    are later rolled back if the transaction fails. */
 int pthread_mutex_lock(pthread_mutex_t* mutex) {
   fix_mutex_kind(mutex);
-  return __pthread_mutex_lock(mutex);
+  if (!real_pthread_mutex_lock) {
+#ifdef DOUBLE_UNDERSCORE_PTHREAD_LOCK_AVAILABLE
+    return __pthread_mutex_lock(mutex);
+#else
+    real_pthread_mutex_lock = dlsym(RTLD_NEXT, "pthread_mutex_lock");
+#endif
+  }
+  return real_pthread_mutex_lock(mutex);
 }
 
 int pthread_mutex_timedlock(pthread_mutex_t* mutex,
                             const struct timespec* abstime) {
   fix_mutex_kind(mutex);
   /* No __pthread_mutex_timedlock stub exists, so we have to use the
-   * indirect call.
+   * indirect call no matter what.
    */
   if (!real_pthread_mutex_timedlock) {
     real_pthread_mutex_timedlock = dlsym(RTLD_NEXT, "pthread_mutex_timedlock");
@@ -63,31 +114,25 @@ int pthread_mutex_timedlock(pthread_mutex_t* mutex,
 
 int pthread_mutex_trylock(pthread_mutex_t* mutex) {
   fix_mutex_kind(mutex);
-  return __pthread_mutex_trylock(mutex);
+  if (!real_pthread_mutex_trylock) {
+#ifdef DOUBLE_UNDERSCORE_PTHREAD_LOCK_AVAILABLE
+    return __pthread_mutex_trylock(mutex);
+#else
+    real_pthread_mutex_trylock = dlsym(RTLD_NEXT, "pthread_mutex_trylock");
+#endif
+  }
+  return real_pthread_mutex_trylock(mutex);
 }
 
-/**
- * Exported glibc synonym for |sysconf()|.  We can't use |dlsym()| to
- * resolve the next "sysconf" symbol, because
- *  - dlysym usually calls malloc()
- *  - custom allocators like jemalloc may use sysconf()
- *  - if our sysconf wrapper is re-entered during initialization, it
- *    has nothing to fall back on to get the conf name, and chaos will
- *    likely ensue if we return something random.
- */
-long __sysconf(int name);
+typedef void* Dlopen(const char* filename, int flags);
 
-/**
- *  Pretend that only 1 processor is configured/online, because rr
- *  binds all tracees to one logical CPU.
- */
-long sysconf(int name) {
-  switch (name) {
-    case _SC_NPROCESSORS_ONLN:
-    case _SC_NPROCESSORS_CONF:
-      return globals.pretend_num_cores ? globals.pretend_num_cores : 1;
-  }
-  return __sysconf(name);
+void* dlopen(const char* filename, int flags) {
+  // Give up our timeslice now. This gives us a full timeslice to
+  // execute the dlopen(), reducing the chance we'll hit
+  // https://sourceware.org/bugzilla/show_bug.cgi?id=19329.
+  Dlopen* f_ptr = (Dlopen*)dlsym(RTLD_NEXT, "dlopen");
+  sched_yield();
+  return f_ptr(filename, flags);
 }
 
 /** Disable XShm since rr doesn't work with it */
@@ -105,6 +150,9 @@ void* XShmCreateImage(__attribute__((unused)) register void* dpy,
                       __attribute__((unused)) unsigned int height) {
   return 0;
 }
+
+RR_HIDDEN char impose_syscall_delay;
+RR_HIDDEN char impose_spurious_desched;
 
 /**
  * This is for testing purposes only.
@@ -128,12 +176,21 @@ void spurious_desched_syscall(struct syscall_info* info) {
   impose_spurious_desched = 0;
 }
 
+#ifndef __aarch64__
+
 /**
  * glibc geteuid() can be compiled to instructions ending in "syscall; ret"
  * which sometimes can't be hooked. So override it here with something that
  * can be hooked.
+ * This is not an issue on aarch64 since we only need to patch a single instruction.
  */
-uid_t geteuid(void) { return syscall(SYS_geteuid); }
+uid_t geteuid(void) {
+#ifdef __i386__
+  return syscall(SYS_geteuid32);
+#else
+  return syscall(SYS_geteuid);
+#endif
+}
 
 /**
  * clang's LeakSanitizer has regular threads call sched_yield() in a loop while
@@ -157,21 +214,22 @@ int sched_yield(void) {
   return 0;
 }
 
-typedef void* (*fopen_ptr)(const char* filename, const char* mode);
-
-static void random_device_init_helper(void* this) {
-  void** file_ptr = (void**)this;
-  void* f_ptr = dlsym(RTLD_DEFAULT, "fopen");
-  fopen_ptr fopen = (fopen_ptr)f_ptr;
-  *file_ptr = fopen("/dev/urandom", "rb");
-}
-
 /**
  * libstdc++3 uses RDRAND. Bypass that with this incredible hack.
  */
 void _ZNSt13random_device7_M_initERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEE(
     void* this, __attribute__((unused)) void* token) {
-  random_device_init_helper(this);
+  static void (*assign_string)(void *, char*) = NULL;
+  static void (*random_init)(void *, void*) = NULL;
+  if (!assign_string) {
+    assign_string = (void (*)(void *, char*))dlsym(RTLD_NEXT,
+      "_ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE6assignEPKc");
+  }
+  assign_string(token, "/dev/urandom");
+  if (!random_init) {
+    random_init = (void (*)(void *, void*))dlsym(RTLD_NEXT, __func__);
+  }
+  random_init(this, token);
 }
 
 /**
@@ -179,5 +237,17 @@ void _ZNSt13random_device7_M_initERKNSt7__cxx1112basic_stringIcSt11char_traitsIc
  */
 void _ZNSt13random_device7_M_initERKSs(void* this,
                                        __attribute__((unused)) void* token) {
-  random_device_init_helper(this);
+  static void (*assign_string)(void *, char*) = NULL;
+  static void (*random_init)(void *, void*) = NULL;
+  if (!assign_string) {
+    assign_string = (void (*)(void *, char*))dlsym(RTLD_NEXT,
+      "_ZNSs6assignEPKc");
+  }
+  assign_string(token, "/dev/urandom");
+  if (!random_init) {
+    random_init = (void (*)(void *, void*))dlsym(RTLD_NEXT, __func__);
+  }
+  random_init(this, token);
 }
+
+#endif

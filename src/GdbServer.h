@@ -64,14 +64,14 @@ public:
   /**
    * Create a gdbserver serving the replay of 'session'.
    */
-  GdbServer(std::shared_ptr<ReplaySession> session,
-            const ReplaySession::Flags& flags, const Target& target)
+  GdbServer(std::shared_ptr<ReplaySession> session, const Target& target)
       : target(target),
         final_event(UINT32_MAX),
         in_debuggee_end_state(false),
         stop_replaying_to_target(false),
         interrupt_pending(false),
-        timeline(std::move(session), flags),
+        exit_sigkill_pending(false),
+        timeline(std::move(session)),
         emergency_debug_session(nullptr) {
     memset(&stop_siginfo, 0, sizeof(stop_siginfo));
   }
@@ -87,7 +87,8 @@ public:
    */
   static void launch_gdb(ScopedFd& params_pipe_fd,
                          const std::string& gdb_binary_file_path,
-                         const std::vector<std::string>& gdb_options);
+                         const std::vector<std::string>& gdb_options,
+                         bool serve_files);
 
   /**
    * Start a debugging connection for |t| and return when there are no
@@ -142,7 +143,7 @@ private:
    */
   void dispatch_debugger_request(Session& session, const GdbRequest& req,
                                  ReportState state);
-  bool at_target();
+  bool at_target(ReplayResult& result);
   void activate_debugger();
   void restart_session(const GdbRequest& req);
   GdbRequest process_debugger_requests(ReportState state = REPORT_NORMAL);
@@ -208,7 +209,7 @@ private:
    * an entry to `files` with the file contents and return our internal
    * file descriptor.
    */
-  int open_file(Session& session, const std::string& file_name);
+  int open_file(Session& session, Task *continue_task, const std::string& file_name);
 
   Target target;
   // dbg is initially null. Once the debugger connection is established, it
@@ -233,6 +234,8 @@ private:
   // True when a DREQ_INTERRUPT has been received but not handled, or when
   // we've restarted and want the first continue to be interrupted immediately.
   bool interrupt_pending;
+  // True when a user has run to exit before attaching the debugger.
+  bool exit_sigkill_pending;
 
   ReplayTimeline timeline;
   Session* emergency_debug_session;
@@ -259,7 +262,7 @@ private:
   Checkpoint debugger_restart_checkpoint;
 
   // gdb checkpoints, indexed by ID
-  std::map<int, Checkpoint> checkpoints;
+  std::map<int64_t, Checkpoint> checkpoints;
 
   // Set of symbols to look up, for qSymbol.
   std::set<std::string> symbols;
@@ -270,6 +273,7 @@ private:
   // file descriptor. Exposing our real file descriptor values is probably a
   // bad idea.
   std::map<int, ScopedFd> files;
+  std::map<int, FileId> memory_files;
   // The pid for gdb's last vFile:setfs
   pid_t file_scope_pid;
 };

@@ -11,6 +11,7 @@ class Task;
 #include <memory>
 #include <vector>
 
+#include "preload/preload_interface.h"
 #include "util.h"
 
 namespace rr {
@@ -33,6 +34,12 @@ public:
     ProcMem,
     Stdio,
     VirtualPerfCounter,
+    NonvirtualPerfCounter,
+    SysCpu,
+    ProcStat,
+    RRPage,
+    ODirect,
+    BpfMap,
   };
 
   virtual Type type() { return Base; }
@@ -117,7 +124,13 @@ public:
    * if desired.
    */
   virtual void filter_getdents(RecordTask*) {}
+
+  virtual enum syscallbuf_fd_classes get_syscallbuf_class() {
+    return FD_CLASS_TRACED;
+  }
 };
+
+std::string file_monitor_type_name(FileMonitor::Type t);
 
 } // namespace rr
 

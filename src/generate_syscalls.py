@@ -1,16 +1,22 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python3
 
 import assembly_templates
-import StringIO
+from io import StringIO
 import os
 import string
 import sys
 import syscalls
 
+def arch_syscall_number(arch, syscall):
+    s = getattr(syscall[1], arch)
+    if s == None:
+        s = -1
+    return s
+
 def write_syscall_enum(f, arch):
     f.write("enum Syscalls {\n")
     undefined_syscall = -1
-    for name, obj in sorted(syscalls.all(), key=lambda x: getattr(x[1], arch)):
+    for name, obj in sorted(syscalls.all(), key=lambda x: arch_syscall_number(arch, x)):
         syscall_number = getattr(obj, arch)
         if syscall_number is not None:
             enum_number = syscall_number
@@ -25,7 +31,7 @@ def write_syscall_enum(f, arch):
 def write_syscall_enum_for_tests(f, arch):
     f.write("enum Syscalls {\n")
     undefined_syscall = -1
-    for name, obj in sorted(syscalls.all(), key=lambda x: getattr(x[1], arch)):
+    for name, obj in sorted(syscalls.all(), key=lambda x: arch_syscall_number(arch, x)):
         syscall_number = getattr(obj, arch)
         if syscall_number is not None:
             enum_number = syscall_number
@@ -39,7 +45,7 @@ def write_syscall_enum_for_tests(f, arch):
 def write_syscallname_arch(f):
     f.write("template <typename Arch> static std::string syscallname_arch(int syscall);\n")
     f.write("\n");
-    for specializer, arch in [("X86Arch", "x86"), ("X64Arch", "x64")]:
+    for specializer, arch in [("X86Arch", "x86"), ("X64Arch", "x64"), ("ARM64Arch", "generic")]:
         f.write("template <> std::string syscallname_arch<%s>(int syscall) {\n" % specializer)
         f.write("  switch (syscall) {\n");
         def write_case(name):
@@ -77,6 +83,8 @@ has_${syscall}_syscall(SupportedArch arch) {
       return X86Arch::${syscall} >= 0;
     case x86_64:
       return X64Arch::${syscall} >= 0;
+    case aarch64:
+      return ARM64Arch::${syscall} >= 0;
     default:
       DEBUG_ASSERT(0 && "unsupported architecture");
       return false;
@@ -91,6 +99,8 @@ is_${syscall}_syscall(int syscallno, SupportedArch arch) {
       return syscallno >= 0 && syscallno == X86Arch::${syscall};
     case x86_64:
       return syscallno >= 0 && syscallno == X64Arch::${syscall};
+    case aarch64:
+      return syscallno >= 0 && syscallno == ARM64Arch::${syscall};
     default:
       DEBUG_ASSERT(0 && "unsupported architecture");
       return false;
@@ -107,6 +117,9 @@ syscall_number_for_${syscall}(SupportedArch arch) {
     case x86_64:
       DEBUG_ASSERT(X64Arch::${syscall} >= 0);
       return X64Arch::${syscall};
+    case aarch64:
+      DEBUG_ASSERT(ARM64Arch::${syscall} >= 0);
+      return ARM64Arch::${syscall};
     default:
       DEBUG_ASSERT(0 && "unsupported architecture");
       return -1;
@@ -137,8 +150,10 @@ generators_for = {
     'CheckSyscallNumbers': write_check_syscall_numbers,
     'SyscallEnumsX86': lambda f: write_syscall_enum(f, 'x86'),
     'SyscallEnumsX64': lambda f: write_syscall_enum(f, 'x64'),
+    'SyscallEnumsGeneric': lambda f: write_syscall_enum(f, 'generic'),
     'SyscallEnumsForTestsX86': lambda f: write_syscall_enum_for_tests(f, 'x86'),
     'SyscallEnumsForTestsX64': lambda f: write_syscall_enum_for_tests(f, 'x64'),
+    'SyscallEnumsForTestsGeneric': lambda f: write_syscall_enum_for_tests(f, 'generic'),
     'SyscallnameArch': write_syscallname_arch,
     'SyscallRecordCase': write_syscall_record_cases,
     'SyscallHelperFunctions': write_syscall_helper_functions,
@@ -154,7 +169,7 @@ def main(argv):
     else:
         before = ""
 
-    stream = StringIO.StringIO()
+    stream = StringIO()
     generators_for[base](stream)
     after = stream.getvalue()
     stream.close()

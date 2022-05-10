@@ -21,6 +21,12 @@ Event::Event(const Event& o) : event_type(o.event_type) {
     case EV_DESCHED:
       new (&Desched()) DeschedEvent(o.Desched());
       return;
+    case EV_PATCH_SYSCALL:
+      new (&PatchSyscall()) PatchSyscallEvent(o.PatchSyscall());
+      return;
+    case EV_SCHED:
+      new (&Sched()) SchedEvent(o.Sched());
+      return;
     case EV_SIGNAL:
     case EV_SIGNAL_DELIVERY:
     case EV_SIGNAL_HANDLER:
@@ -42,6 +48,9 @@ Event::~Event() {
   switch (event_type) {
     case EV_DESCHED:
       Desched().~DeschedEvent();
+      return;
+    case EV_PATCH_SYSCALL:
+      PatchSyscall().~PatchSyscallEvent();
       return;
     case EV_SIGNAL:
     case EV_SIGNAL_DELIVERY:
@@ -89,9 +98,12 @@ bool Event::record_extra_regs() const {
     case EV_SYSCALL: {
       const SyscallEvent& sys_ev = Syscall();
       // sigreturn/rt_sigreturn restores register state
+      // execve sets everything under the sun, and
+      // pkey_alloc modifies the PKRU register.
       return sys_ev.state == EXITING_SYSCALL &&
              (is_sigreturn(sys_ev.number, sys_ev.arch()) ||
-              is_execve_syscall(sys_ev.number, sys_ev.arch()));
+              sys_ev.is_exec() ||
+              is_pkey_alloc_syscall(sys_ev.number, sys_ev.arch()));
     }
     case EV_SIGNAL_HANDLER:
       // entering a signal handler seems to clear FP/SSE regs,
@@ -135,8 +147,6 @@ bool Event::is_syscall_event() const {
       return false;
   }
 }
-
-void Event::log() const { LOG(info) << *this; }
 
 string Event::str() const {
   stringstream ss;
@@ -208,7 +218,7 @@ std::string Event::type_name() const {
 #undef CASE
     default:
       FATAL() << "Unknown event type " << event_type;
-      return nullptr; // not reached
+      return ""; // not reached
   }
 }
 

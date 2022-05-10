@@ -19,15 +19,27 @@ using namespace std;
 
 namespace rr {
 
-void FdTable::add_monitor(int fd, FileMonitor* monitor) {
+void FdTable::add_monitor(Task* t, int fd, FileMonitor* monitor) {
   // In the future we could support multiple monitors on an fd, but we don't
   // need to yet.
-  DEBUG_ASSERT(!is_monitoring(fd));
+  FileMonitor* current = get_monitor(fd);
+  if (current) {
+    ASSERT(t, false) << "Task " << t->rec_tid << " already monitoring fd "
+      << fd << " " << file_monitor_type_name(current->type());
+  }
   if (fd >= SYSCALLBUF_FDS_DISABLED_SIZE && fds.count(fd) == 0) {
     fd_count_beyond_limit++;
   }
   fds[fd] = FileMonitor::shr_ptr(monitor);
   update_syscallbuf_fds_disabled(fd);
+}
+
+void FdTable::replace_monitor(Task* t, int fd, FileMonitor* monitor) {
+  if (!is_monitoring(fd)) {
+    add_monitor(t, fd, monitor);
+  } else {
+    fds[fd] = FileMonitor::shr_ptr(monitor);
+  }
 }
 
 bool FdTable::is_rr_fd(int fd) {
@@ -116,21 +128,26 @@ void FdTable::did_close(int fd) {
 FileMonitor* FdTable::get_monitor(int fd) {
   auto it = fds.find(fd);
   if (it == fds.end()) {
-    return NULL;
+    return nullptr;
   }
   return it->second.get();
 }
 
-static bool is_fd_monitored_in_any_task(AddressSpace* vm, int fd) {
+static syscallbuf_fd_classes join_fd_classes_over_tasks(AddressSpace* vm, int fd) {
+  syscallbuf_fd_classes cls = FD_CLASS_UNTRACED;
   for (Task* t : vm->task_set()) {
     auto table = t->fd_table();
-    if (table->is_monitoring(fd) ||
-        (fd >= SYSCALLBUF_FDS_DISABLED_SIZE - 1 &&
-         table->count_beyond_limit() > 0)) {
-      return true;
+    if (table->is_monitoring(fd)) {
+      if (cls != FD_CLASS_UNTRACED) {
+        return FD_CLASS_TRACED;
+      }
+      cls = table->get_monitor(fd)->get_syscallbuf_class();
+    } else if (fd >= SYSCALLBUF_FDS_DISABLED_SIZE - 1 &&
+        table->count_beyond_limit() > 0) {
+      return FD_CLASS_TRACED;
     }
   }
-  return false;
+  return cls;
 }
 
 void FdTable::update_syscallbuf_fds_disabled(int fd) {
@@ -145,6 +162,9 @@ void FdTable::update_syscallbuf_fds_disabled(int fd) {
       return;
     }
     RecordTask* rt = static_cast<RecordTask*>(t);
+    if (rt->already_exited()) {
+      continue;
+    }
 
     AddressSpace* vm = rt->vm().get();
     if (vms_updated.find(vm) != vms_updated.end()) {
@@ -156,9 +176,9 @@ void FdTable::update_syscallbuf_fds_disabled(int fd) {
       if (fd >= SYSCALLBUF_FDS_DISABLED_SIZE) {
         fd = SYSCALLBUF_FDS_DISABLED_SIZE - 1;
       }
-      char disable = (char)is_fd_monitored_in_any_task(vm, fd);
+      char disable = (char)join_fd_classes_over_tasks(vm, fd);
       auto addr =
-          REMOTE_PTR_FIELD(t->preload_globals, syscallbuf_fds_disabled[0]) + fd;
+          REMOTE_PTR_FIELD(t->preload_globals, syscallbuf_fd_class[0]) + fd;
       rt->write_mem(addr, disable);
       rt->record_local(addr, &disable);
     }
@@ -190,11 +210,15 @@ void FdTable::init_syscallbuf_fds_disabled(Task* t) {
       if (fd >= SYSCALLBUF_FDS_DISABLED_SIZE) {
         fd = SYSCALLBUF_FDS_DISABLED_SIZE - 1;
       }
-      disabled[fd] = 1;
+      if (disabled[fd] == FD_CLASS_UNTRACED) {
+        disabled[fd] = it.second->get_syscallbuf_class();
+      } else {
+        disabled[fd] = FD_CLASS_TRACED;
+      }
     }
   }
 
-  auto addr = REMOTE_PTR_FIELD(t->preload_globals, syscallbuf_fds_disabled[0]);
+  auto addr = REMOTE_PTR_FIELD(t->preload_globals, syscallbuf_fd_class[0]);
   rt->write_mem(addr, disabled, SYSCALLBUF_FDS_DISABLED_SIZE);
   rt->record_local(addr, disabled, SYSCALLBUF_FDS_DISABLED_SIZE);
 }

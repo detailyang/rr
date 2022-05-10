@@ -54,6 +54,13 @@ void print_global_options(FILE* out) {
   fputs(
       "Global options:\n"
       "  --disable-cpuid-faulting   disable use of CPUID faulting\n"
+      "  --disable-ptrace-exit_events disable use of PTRACE_EVENT_EXIT\n"
+      "  --resource-path=PATH       specify the paths that rr should use to "
+      "find\n"
+      "                             files such as rr_page_*.  These files "
+      "should\n"
+      "                             be located in PATH/bin, PATH/lib[64], and\n"
+      "                             PATH/share as appropriate.\n"
       "  -A, --microarch=<NAME>     force rr to assume it's running on a CPU\n"
       "                             with microarch NAME even if runtime "
       "detection\n"
@@ -62,29 +69,11 @@ void print_global_options(FILE* out) {
       "                             'Ivy Bridge'. Note that rr will not work "
       "with\n"
       "                             Intel Merom or Penryn microarchitectures.\n"
-      "  -C, --checksum={on-syscalls,on-all-events}|FROM_TIME\n"
-      "                             compute and store (during recording) or\n"
-      "                             read and verify (during replay) checksums\n"
-      "                             of each of a tracee's memory mappings "
-      "either\n"
-      "                             at the end of all syscalls "
-      "(`on-syscalls'),\n"
-      "                             at all events (`on-all-events'), or \n"
-      "                             starting from a global timepoint "
-      "FROM_TIME\n"
-      "  -D, --dump-on=<SYSCALL_NUM|-SIGNAL_NUM>\n"
-      "                             dump memory at SYSCALL or SIGNAL to the\n"
-      "                             file "
-      "`[trace_dir]/[tid].[time]_{rec,rep}':\n"
-      "                             `_rec' for dumps during recording, `_rep'\n"
-      "                             for dumps during replay\n"
       "  -F, --force-things         force rr to do some things that don't "
       "seem\n"
       "                             like good ideas, for example launching an\n"
       "                             interactive emergency debugger if stderr\n"
       "                             isn't a tty.\n"
-      "  -K, --check-cached-mmaps   verify that cached task mmaps match "
-      "/proc/maps\n"
       "  -E, --fatal-errors         any warning or error that is printed is\n"
       "                             treated as fatal\n"
       "  -M, --mark-stdio           mark stdio writes with [rr <PID> <EV>]\n"
@@ -95,9 +84,13 @@ void print_global_options(FILE* out) {
       "  -S, --suppress-environment-warnings\n"
       "                             suppress warnings about issues in the\n"
       "                             environment that rr has no control over\n"
-      "  -T, --dump-at=TIME         dump memory at global timepoint TIME\n"
+      "  --log=<spec>               Set logging config to <spec>. See RR_LOG.\n"
       "\n"
-      "Use RR_LOG to control logging; e.g. RR_LOG=all:warn,Task:debug\n",
+      "Environment variables:\n"
+      " $RR_LOG        logging configuration ; e.g. RR_LOG=all:warn,Task:debug\n"
+      " $RR_TMPDIR     to use a different TMPDIR than the recorded program\n"
+      " $_RR_TRACE_DIR where traces will be stored;\n"
+      "                falls back to $XDG_DATA_HOME / $HOME/.local/share/rr\n",
       out);
 }
 
@@ -114,6 +107,10 @@ void print_usage(FILE* out) {
         "otherwise we assume the 'record' subcommand.\n\n",
         out);
   print_global_options(out);
+
+  /* we should print usage when utility being wrongly used.
+     use 'exit' with failure code */
+  exit(EXIT_FAILURE);
 }
 
 static void init_random() {
@@ -127,6 +124,9 @@ static void init_random() {
 bool parse_global_option(std::vector<std::string>& args) {
   static const OptionSpec options[] = {
     { 0, "disable-cpuid-faulting", NO_PARAMETER },
+    { 1, "disable-ptrace-exit-events", NO_PARAMETER },
+    { 2, "resource-path", HAS_PARAMETER },
+    { 3, "log", HAS_PARAMETER },
     { 'A', "microarch", HAS_PARAMETER },
     { 'C', "checksum", HAS_PARAMETER },
     { 'D', "dump-on", HAS_PARAMETER },
@@ -138,7 +138,6 @@ bool parse_global_option(std::vector<std::string>& args) {
     { 'N', "version", NO_PARAMETER },
     { 'S', "suppress-environment-warnings", NO_PARAMETER },
     { 'T', "dump-at", HAS_PARAMETER },
-    { 'U', "cpu-unbound", NO_PARAMETER },
   };
 
   ParsedOption opt;
@@ -150,6 +149,18 @@ bool parse_global_option(std::vector<std::string>& args) {
   switch (opt.short_name) {
     case 0:
       flags.disable_cpuid_faulting = true;
+      break;
+    case 1:
+      flags.disable_ptrace_exit_events = true;
+      break;
+    case 2:
+      flags.resource_path = opt.value;
+      if (flags.resource_path.back() != '/') {
+        flags.resource_path.append("/");
+      }
+      break;
+    case 3:
+      apply_log_spec(opt.value.c_str());
       break;
     case 'A':
       flags.forced_uarch = opt.value;
@@ -203,11 +214,24 @@ bool parse_global_option(std::vector<std::string>& args) {
   return true;
 }
 
+static char* saved_argv0_;
+static size_t saved_argv0_space_;
+
+char* saved_argv0() {
+  return saved_argv0_;
+}
+size_t saved_argv0_space() {
+  return saved_argv0_space_;
+}
+
 } // namespace rr
 
 using namespace rr;
 
 int main(int argc, char* argv[]) {
+  rr::saved_argv0_ = argv[0];
+  rr::saved_argv0_space_ = argv[argc - 1] + strlen(argv[argc - 1]) + 1 - rr::saved_argv0_;
+
   init_random();
   raise_resource_limits();
 
@@ -230,7 +254,6 @@ int main(int argc, char* argv[]) {
 
   if (args.size() == 0) {
     print_usage(stderr);
-    return 1;
   }
 
   auto command = Command::command_for_name(args[0]);
@@ -239,7 +262,6 @@ int main(int argc, char* argv[]) {
   } else {
     if (!Command::verify_not_option(args)) {
       print_usage(stderr);
-      return 1;
     }
     if (is_directory(args[0].c_str())) {
       command = ReplayCommand::get();

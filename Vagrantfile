@@ -10,12 +10,12 @@ Vagrant.configure("2") do |config|
 	config.vm.provision "shell", inline: <<-SHELL
 		apt-get update
 		# DEBIAN_FRONTEND=noninteractive apt-get -y upgrade
-		DEBIAN_FRONTEND=noninteractive apt-get -y install ccache cmake make g++-multilib gdb pkg-config realpath python-pexpect manpages-dev git ninja-build capnproto libcapnp-dev
+		DEBIAN_FRONTEND=noninteractive apt-get -y install ccache cmake make g++-multilib gdb pkg-config realpath python-pexpect manpages-dev git ninja-build capnproto libcapnp-dev zlib1g-dev
 		apt-get clean
 	SHELL
 
 	config.vm.provision "shell", privileged: false, inline: <<-SHELL
-		git clone https://github.com/mozilla/rr.git
+		git clone https://github.com/rr-debugger/rr.git
 		cd rr
 		mkdir obj
 		cd obj

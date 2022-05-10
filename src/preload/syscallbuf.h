@@ -3,6 +3,8 @@
 #ifndef RR_SYSCALLBUF_H_
 #define RR_SYSCALLBUF_H_
 
+struct timespec;
+
 #define RR_HIDDEN __attribute__((visibility("hidden")))
 
 RR_HIDDEN extern struct preload_globals globals;

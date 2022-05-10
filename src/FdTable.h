@@ -20,7 +20,8 @@ class FdTable : public HasTaskSet {
 public:
   typedef std::shared_ptr<FdTable> shr_ptr;
 
-  void add_monitor(int fd, FileMonitor* monitor);
+  void add_monitor(Task* t, int fd, FileMonitor* monitor);
+  void replace_monitor(Task* t, int fd, FileMonitor* monitor);
   bool emulate_ioctl(int fd, RecordTask* t, uint64_t* result);
   bool emulate_fcntl(int fd, RecordTask* t, uint64_t* result);
   bool emulate_read(int fd, RecordTask* t,
@@ -34,11 +35,10 @@ public:
   void did_dup(int from, int to);
   void did_close(int fd);
 
-  shr_ptr clone(Task* t) {
-    shr_ptr fds(new FdTable(*this));
-    fds->insert_task(t);
-    return fds;
+  shr_ptr clone() const {
+    return shr_ptr(new FdTable(*this));
   }
+
   static shr_ptr create(Task* t) {
     shr_ptr fds(new FdTable());
     fds->insert_task(t);

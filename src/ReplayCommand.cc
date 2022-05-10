@@ -23,8 +23,6 @@ using namespace std;
 
 namespace rr {
 
-static int DUMP_STATS_PERIOD = 0;
-
 ReplayCommand ReplayCommand::singleton(
     "replay",
     " rr replay [OPTION]... [<trace-dir>] [-- <debugger-options>]\n"
@@ -36,6 +34,9 @@ ReplayCommand ReplayCommand::singleton(
     "<EVENT-NUM>\n"
     "                             in the trace.  See -M in the general "
     "options.\n"
+    "  -e, --goto-exit            start a debug server at the end of the "
+    "recording\n"
+    "                             or the end of the specified process.\n"
     "  -o, --debugger-option=<OPTION>\n"
     "                             pass <OPTION> to debugger\n"
     "  -p, --onprocess=<PID>|<COMMAND>\n"
@@ -63,7 +64,16 @@ ReplayCommand ReplayCommand::singleton(
     "  -t, --trace=<EVENT>        singlestep instructions and dump register\n"
     "                             states when replaying towards <EVENT> or\n"
     "                             later\n"
-    "  -x, --gdb-x=<FILE>         execute gdb commands from <FILE>\n");
+    "  -u, --cpu-unbound          allow replay to run on any CPU. Default is\n"
+    "                             to run on the CPU stored in the trace.\n"
+    "                             Note that this may diverge from the recording\n"
+    "                             in some cases.\n"
+    "  -x, --gdb-x=<FILE>         execute gdb commands from <FILE>\n"
+    "  --stats=<N>                display brief stats every N steps (eg 10000).\n"
+    "  --serve-files              Serve all files from the trace rather than\n"
+    "                             assuming they exist on disk. Debugging will\n"
+    "                             be slower, but be able to tolerate missing files\n"
+    "  --tty <file>               Redirect tracee replay output to <file>\n");
 
 struct ReplayFlags {
   // Start a debug server for the task scheduled at the first
@@ -108,9 +118,21 @@ struct ReplayFlags {
   /* When true, echo tracee stdout/stderr writes to console. */
   bool redirect;
 
+  /* When true, do not bind to the CPU stored in the trace file. */
+  bool cpu_unbound;
+
   // When true make all private mappings shared with the tracee by default
   // to test the corresponding code.
   bool share_private_mappings;
+
+  // When nonzero, display statistics every N steps.
+  uint32_t dump_interval;
+
+  // When set, serve files from the tracer rather than asking GDB
+  // to get them from the filesystem
+  bool serve_files;
+
+  string tty;
 
   ReplayFlags()
       : goto_event(0),
@@ -123,7 +145,10 @@ struct ReplayFlags {
         keep_listening(false),
         gdb_binary_file_path("gdb"),
         redirect(true),
-        share_private_mappings(false) {}
+        cpu_unbound(false),
+        share_private_mappings(false),
+        dump_interval(0),
+        serve_files(false) {}
 };
 
 static bool parse_replay_arg(vector<string>& args, ReplayFlags& flags) {
@@ -134,6 +159,7 @@ static bool parse_replay_arg(vector<string>& args, ReplayFlags& flags) {
   static const OptionSpec options[] = {
     { 'a', "autopilot", NO_PARAMETER },
     { 'd', "debugger", HAS_PARAMETER },
+    { 'e', "goto-exit", NO_PARAMETER },
     { 'k', "keep-listening", NO_PARAMETER },
     { 'f', "onfork", HAS_PARAMETER },
     { 'g', "goto", HAS_PARAMETER },
@@ -146,6 +172,10 @@ static bool parse_replay_arg(vector<string>& args, ReplayFlags& flags) {
     { 'x', "gdb-x", HAS_PARAMETER },
     { 0, "share-private-mappings", NO_PARAMETER },
     { 1, "fullname", NO_PARAMETER },
+    { 2, "stats", HAS_PARAMETER },
+    { 3, "serve-files", NO_PARAMETER },
+    { 4, "tty", HAS_PARAMETER },
+    { 'u', "cpu-unbound", NO_PARAMETER },
     { 'i', "interpreter", HAS_PARAMETER }
   };
   ParsedOption opt;
@@ -160,6 +190,9 @@ static bool parse_replay_arg(vector<string>& args, ReplayFlags& flags) {
       break;
     case 'd':
       flags.gdb_binary_file_path = opt.value;
+      break;
+    case 'e':
+      flags.goto_event = -1;
       break;
     case 'f':
       if (!opt.verify_valid_int(1, INT32_MAX)) {
@@ -220,6 +253,21 @@ static bool parse_replay_arg(vector<string>& args, ReplayFlags& flags) {
       break;
     case 1:
       flags.gdb_options.push_back("--fullname");
+      break;
+    case 2:
+      if (!opt.verify_valid_int(1, INT32_MAX)) {
+        return false;
+      }
+      flags.dump_interval = opt.int_value;
+      break;
+    case 3:
+      flags.serve_files = true;
+      break;
+    case 4:
+      flags.tty = opt.value;
+      break;
+    case 'u':
+      flags.cpu_unbound = true;
       break;
     case 'i':
       flags.gdb_options.push_back("-i");
@@ -292,7 +340,9 @@ static pid_t waiting_for_child;
 static ReplaySession::Flags session_flags(const ReplayFlags& flags) {
   ReplaySession::Flags result;
   result.redirect_stdio = flags.redirect;
+  result.redirect_stdio_file = flags.tty;
   result.share_private_mappings = flags.share_private_mappings;
+  result.cpu_unbound = flags.cpu_unbound;
   return result;
 }
 
@@ -302,10 +352,11 @@ static uint64_t to_microseconds(const struct timeval& tv) {
 
 static void serve_replay_no_debugger(const string& trace_dir,
                                      const ReplayFlags& flags) {
-  ReplaySession::shr_ptr replay_session = ReplaySession::create(trace_dir);
-  replay_session->set_flags(session_flags(flags));
+  ReplaySession::shr_ptr replay_session =
+    ReplaySession::create(trace_dir, session_flags(flags));
   uint32_t step_count = 0;
   struct timeval last_dump_time;
+  double last_dump_rectime = 0;
   Session::Statistics last_stats;
   gettimeofday(&last_dump_time, NULL);
 
@@ -326,21 +377,28 @@ static void serve_replay_no_debugger(const string& trace_dir,
     auto result = replay_session->replay_step(cmd);
     FrameTime after_time = replay_session->trace_reader().time();
     DEBUG_ASSERT(after_time >= before_time && after_time <= before_time + 1);
+    if (!last_dump_rectime)
+      last_dump_rectime = replay_session->trace_reader().recording_time();
 
     ++step_count;
-    if (DUMP_STATS_PERIOD > 0 && step_count % DUMP_STATS_PERIOD == 0) {
+    if (flags.dump_interval > 0 && step_count % flags.dump_interval == 0) {
       struct timeval now;
       gettimeofday(&now, NULL);
+      double rectime = replay_session->trace_reader().recording_time();
+      uint64_t elapsed_usec = to_microseconds(now) - to_microseconds(last_dump_time);
       Session::Statistics stats = replay_session->statistics();
-      printf(
+      fprintf(stderr,
           "[ReplayStatistics] ticks %lld syscalls %lld bytes_written %lld "
-          "microseconds %lld\n",
+          "microseconds %lld %%realtime %.0f%%\n",
           (long long)(stats.ticks_processed - last_stats.ticks_processed),
           (long long)(stats.syscalls_performed - last_stats.syscalls_performed),
           (long long)(stats.bytes_written - last_stats.bytes_written),
-          (long long)(to_microseconds(now) - to_microseconds(last_dump_time)));
+          (long long)elapsed_usec,
+          100.0 * ((rectime - last_dump_rectime) * 1.0e6) / (double)elapsed_usec
+        );
       last_dump_time = now;
       last_stats = stats;
+      last_dump_rectime = rectime;
     }
 
     if (result.status == REPLAY_EXITED) {
@@ -406,13 +464,13 @@ static int replay(const string& trace_dir, const ReplayFlags& flags) {
     if (target.event == numeric_limits<decltype(target.event)>::max()) {
       serve_replay_no_debugger(trace_dir, flags);
     } else {
-      auto session = ReplaySession::create(trace_dir);
+      auto session = ReplaySession::create(trace_dir, session_flags(flags));
       GdbServer::ConnectionFlags conn_flags;
       conn_flags.dbg_port = flags.dbg_port;
       conn_flags.dbg_host = flags.dbg_host;
       conn_flags.debugger_name = flags.gdb_binary_file_path;
       conn_flags.keep_listening = flags.keep_listening;
-      GdbServer(session, session_flags(flags), target).serve_replay(conn_flags);
+      GdbServer(session, target).serve_replay(conn_flags);
     }
 
     // Everything should have been cleaned up by now.
@@ -433,12 +491,17 @@ static int replay(const string& trace_dir, const ReplayFlags& flags) {
       prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0);
 
       ScopedFd debugger_params_write_pipe(debugger_params_pipe[1]);
-      auto session = ReplaySession::create(trace_dir);
+      auto session = ReplaySession::create(trace_dir, session_flags(flags));
       GdbServer::ConnectionFlags conn_flags;
       conn_flags.dbg_port = flags.dbg_port;
       conn_flags.dbg_host = flags.dbg_host;
       conn_flags.debugger_params_write_pipe = &debugger_params_write_pipe;
-      GdbServer server(session, session_flags(flags), target);
+      if (target.event == -1 && target.pid == 0) {
+        // If `replay -e` is specified without a pid, go to the exit
+        // of the first process (rather than the first exit of a process).
+        target.pid = session->trace_reader().peek_frame().tid();
+      }
+      GdbServer server(session, target);
 
       server_ptr = &server;
       struct sigaction sa;
@@ -471,7 +534,8 @@ static int replay(const string& trace_dir, const ReplayFlags& flags) {
   {
     ScopedFd params_pipe_read_fd(debugger_params_pipe[0]);
     GdbServer::launch_gdb(params_pipe_read_fd, flags.gdb_binary_file_path,
-                          flags.gdb_options);
+                          flags.gdb_options,
+                          flags.serve_files);
   }
 
   // Child must have died before we were able to get debugger parameters
@@ -541,6 +605,11 @@ int ReplayCommand::run(vector<string>& args) {
               flags.target_process);
       return 2;
     }
+  }
+  if (flags.dump_interval > 0 && !flags.dont_launch_debugger) {
+    fprintf(stderr, "--stats requires -a\n");
+    print_help(stderr);
+    return 2;
   }
 
   assert_prerequisites();

@@ -17,10 +17,28 @@
 #include "RecordSession.h"
 #include "core.h"
 #include "ftrace.h"
+#include "kernel_abi.h"
 #include "kernel_metadata.h"
 #include "util.h"
 
 using namespace std;
+
+ostream& operator<<(ostream& stream, const siginfo_t& siginfo) {
+  stream << "{signo:" << rr::signal_name(siginfo.si_signo)
+         << ",errno:" << rr::errno_name(siginfo.si_errno)
+         << ",code:" << rr::sicode_name(siginfo.si_code, siginfo.si_signo);
+  switch (siginfo.si_signo) {
+    case SIGILL:
+    case SIGFPE:
+    case SIGSEGV:
+    case SIGBUS:
+    case SIGTRAP:
+      stream << ",addr:" << siginfo.si_addr;
+      break;
+  }
+  stream << "}";
+  return stream;
+}
 
 namespace rr {
 
@@ -45,7 +63,7 @@ static LogLevel to_log_level(const string& str) {
   if (str == "fatal") {
     return LOG_fatal;
   }
-  fprintf(stderr, "Log level %s in RR_LOG is not valid, assuing 'fatal'\n",
+  fprintf(stderr, "Log level %s in RR_LOG is not valid, assuming 'fatal'\n",
           str.c_str());
   return LOG_fatal;
 }
@@ -59,12 +77,12 @@ static char simple_to_lower(char ch) {
 }
 
 static string simple_to_lower(const string& s) {
-  char* buf = new char[s.size() + 1];
+  std::unique_ptr<char[]> buf(new char[s.size() + 1]);
   for (size_t i = 0; i < s.size(); ++i) {
     buf[i] = simple_to_lower(s[i]);
   }
   buf[s.size()] = 0;
-  return string(buf);
+  return string(buf.get());
 }
 
 #if __has_attribute(require_constant_initialization)
@@ -82,14 +100,77 @@ static LogLevel default_level = LOG_error;
 // C++ libraries have a bug that causes them not to be. _CONSTANT_STATIC should
 // turn this into a compile error rather than a runtime crash for compilers
 // that support the attribute.
+
+// This is the assignment of log levels to module names.
+// Any module name not mentioned here gets the default_log_level.
 _CONSTANT_STATIC unique_ptr<unordered_map<string, LogLevel>> level_map;
-_CONSTANT_STATIC unique_ptr<unordered_map<const char*, LogModule>> log_modules;
-_CONSTANT_STATIC std::unique_ptr<stringstream> logging_stream;
-_CONSTANT_STATIC deque<char>* log_buffer;
-_CONSTANT_STATIC std::ostream* log_file;
+// This is a cache mapping unlimited-lifetime file name pointers (usually
+// derived from __FILE__) to the associated module name and log level.
+// It's OK for this to contain multiple entries for the same string but
+// with different pointers.
+_CONSTANT_STATIC unique_ptr<unordered_map<const void*, LogModule>> log_modules;
+// This collects a single log message.
+_CONSTANT_STATIC unique_ptr<stringstream> logging_stream;
+// When non-null, log messages are accumulated into this buffer.
+_CONSTANT_STATIC unique_ptr<deque<char>> log_buffer;
+// When non-null, log messages are flushed to this file.
+_CONSTANT_STATIC ostream* log_file;
+// Maximum size of `log_buffer`.
 size_t log_buffer_size;
 
 static void flush_log_file() { log_file->flush(); }
+
+static void init_log_globals();
+
+void apply_log_spec(const char *spec) {
+  init_log_globals();
+  char *env = strdup(spec);
+  DEBUG_ASSERT(env);
+  for (int i = 0; env[i]; ++i) {
+    env[i] = simple_to_lower(env[i]);
+  }
+  char* p = env;
+  while (*p) {
+    char* end = strchrnul(p, ',');
+    char* sep = strchrnul(p, ':');
+    string n;
+    LogLevel level;
+    if (sep >= end) {
+      n = string(p, end - p);
+      level = LOG_debug;
+    } else {
+      n = string(p, sep - p);
+      if (sep + 1 == end) {
+        level = LOG_fatal;
+      } else {
+        level = to_log_level(string(sep + 1, end - (sep + 1)));
+      }
+    }
+    if (n == "" || n == "all") {
+      level_map->clear();
+      default_level = level;
+    } else {
+      (*level_map)[n] = level;
+    }
+    if (*end) {
+      p = end + 1;
+    } else {
+      p = end;
+    }
+  }
+  free(env);
+}
+
+void apply_log_spec_from_env() {
+  const char* log_env = "RR_LOG";
+  if (running_under_rr()) {
+    log_env = "RR_UNDER_RR_LOG";
+  }
+  char* env = getenv(log_env);
+  if (env) {
+    apply_log_spec(env);
+  }
+}
 
 static void init_log_globals() {
   if (log_globals_initialized) {
@@ -98,22 +179,26 @@ static void init_log_globals() {
   log_globals_initialized = true;
   level_map = unique_ptr<unordered_map<string, LogLevel>>(
       new unordered_map<string, LogLevel>());
-  log_modules = unique_ptr<unordered_map<const char*, LogModule>>(
-      new unordered_map<const char*, LogModule>());
+  log_modules = unique_ptr<unordered_map<const void*, LogModule>>(
+      new unordered_map<const void*, LogModule>());
   logging_stream = unique_ptr<stringstream>(new stringstream());
 
   const char* buffer = getenv("RR_LOG_BUFFER");
   if (buffer) {
     log_buffer_size = atoi(buffer);
     if (log_buffer_size) {
-      log_buffer = new deque<char>();
-      atexit(flush_log_buffer);
+      log_buffer = unique_ptr<deque<char>>(new deque<char>());
     }
   }
 
   const char* filename = getenv("RR_LOG_FILE");
+  ios_base::openmode log_file_open_mode = std::ofstream::out;
+  if (!filename) {
+    filename = getenv("RR_APPEND_LOG_FILE");
+    log_file_open_mode |= std::ofstream::app;
+  }
   if (filename) {
-    auto file = new ofstream(filename);
+    auto file = new ofstream(filename, log_file_open_mode);
     if (!file->good()) {
       delete file;
     } else {
@@ -126,48 +211,7 @@ static void init_log_globals() {
     log_file = &cerr;
   }
 
-  const char* log_env = "RR_LOG";
-  if (running_under_rr()) {
-    log_env = "RR_UNDER_RR_LOG";
-  }
-  char* env = getenv(log_env);
-  if (env) {
-    env = strdup(env);
-    DEBUG_ASSERT(env);
-    for (int i = 0; env[i]; ++i) {
-      env[i] = simple_to_lower(env[i]);
-    }
-    char* p = env;
-    while (*p) {
-      char* end = strchrnul(p, ',');
-      char* sep = strchrnul(p, ':');
-      string n;
-      LogLevel level;
-      if (sep >= end) {
-        n = string(p, end - p);
-        level = LOG_debug;
-      } else {
-        n = string(p, sep - p);
-        if (sep + 1 == end) {
-          level = LOG_fatal;
-        } else {
-          level = to_log_level(string(sep + 1, end - (sep + 1)));
-        }
-      }
-      if (n == "" || n == "all") {
-        level_map->clear();
-        default_level = level;
-      } else {
-        (*level_map)[n] = level;
-      }
-      if (*end) {
-        p = end + 1;
-      } else {
-        p = end;
-      }
-    }
-    free(env);
-  }
+  apply_log_spec_from_env();
 }
 
 static LogLevel get_log_level(const string& name) {
@@ -266,15 +310,19 @@ static void flush_log_stream() {
   logging_stream->str(string());
 }
 
-void flush_log_buffer() {
-  if (log_buffer) {
-    for (char c : *log_buffer) {
+void flush_log_buffer(unique_ptr<deque<char>> &this_log_buffer) {
+  if (this_log_buffer) {
+    for (char c : *this_log_buffer) {
       // We could accumulate in a string to speed things up, but this could get
       // called in low-memory situations so be safe.
       *log_file << c;
     }
-    log_buffer->clear();
+    this_log_buffer->clear();
   }
+}
+
+void flush_log_buffer() {
+  flush_log_buffer(log_buffer);
 }
 
 template <typename T>
@@ -314,7 +362,7 @@ NewlineTerminatingOstream::NewlineTerminatingOstream(LogLevel level,
 
 NewlineTerminatingOstream::~NewlineTerminatingOstream() {
   if (enabled) {
-    log_stream() << std::endl;
+    log_stream() << endl;
     flush_log_stream();
     if (Flags::get().fatal_errors_and_warnings && level <= LOG_warn) {
       notifying_abort();
@@ -329,8 +377,9 @@ CleanFatalOstream::CleanFatalOstream(const char* file, int line,
 }
 
 CleanFatalOstream::~CleanFatalOstream() {
-  cerr << std::endl;
+  cerr << endl;
   flush_log_stream();
+  flush_log_buffer();
   exit(1);
 }
 
@@ -339,7 +388,7 @@ FatalOstream::FatalOstream(const char* file, int line, const char* function) {
 }
 
 FatalOstream::~FatalOstream() {
-  log_stream() << std::endl;
+  log_stream() << endl;
   flush_log_stream();
   notifying_abort();
 }
@@ -373,12 +422,20 @@ static void emergency_debug(Task* t) {
 
   RecordSession* record_session = t->session().as_record();
   if (record_session) {
-    record_session->trace_writer().close();
+    record_session->close_trace_writer(TraceWriter::CLOSE_ERROR);
   }
+
+  // Capture the log buffer now to prevent the log messages from the trace
+  // stream read below from overwriting any data from the actual failure.
+  flush_log_stream();
+  std::unique_ptr<deque<char>> captured_log_buffer = std::move(log_buffer);
+
   TraceStream* trace_stream = t->session().trace_stream();
   if (trace_stream) {
     dump_last_events(*trace_stream);
   }
+
+  flush_log_buffer(captured_log_buffer);
 
   if (probably_not_interactive() && !Flags::get().force_things &&
       !getenv("RUNNING_UNDER_TEST_MONITOR")) {
@@ -386,8 +443,6 @@ static void emergency_debug(Task* t) {
     FATAL()
         << "(session doesn't look interactive, aborting emergency debugging)";
   }
-
-  flush_log_buffer();
 
   GdbServer::emergency_debug(t);
   FATAL() << "Can't resume execution from invalid state";
@@ -408,7 +463,7 @@ EmergencyDebugOstream::EmergencyDebugOstream(bool cond, const Task* t,
 
 EmergencyDebugOstream::~EmergencyDebugOstream() {
   if (!cond) {
-    log_stream() << std::endl;
+    log_stream() << endl;
     flush_log_stream();
     t->log_pending_events();
     emergency_debug(t);

@@ -14,7 +14,9 @@ namespace rr {
 
 ReplayTask::ReplayTask(ReplaySession& session, pid_t _tid, pid_t _rec_tid,
                        uint32_t serial, SupportedArch a)
-    : Task(session, _tid, _rec_tid, serial, a) {}
+    : Task(session, _tid, _rec_tid, serial, a),
+      seen_sched_in_syscallbuf_syscall_hook(false)
+{}
 
 ReplaySession& ReplayTask::session() const {
   return *Task::session().as_replay();
@@ -38,7 +40,7 @@ void ReplayTask::init_buffers_arch(remote_ptr<void> map_hint) {
     init_syscall_buffer(remote, map_hint);
     desched_fd_child = args.desched_counter_fd;
     // Prevent the child from closing this fd
-    fds->add_monitor(desched_fd_child, new PreserveFileMonitor());
+    fds->add_monitor(this, desched_fd_child, new PreserveFileMonitor());
 
     // Skip mmap record. It exists mainly to inform non-replay code
     // (e.g. RemixModule) that this memory will be mapped.
@@ -46,19 +48,11 @@ void ReplayTask::init_buffers_arch(remote_ptr<void> map_hint) {
 
     if (args.cloned_file_data_fd >= 0) {
       cloned_file_data_fd_child = args.cloned_file_data_fd;
-      string clone_file_name = trace_reader().file_data_clone_file_name(tuid());
-      AutoRestoreMem name(remote, clone_file_name.c_str());
-      int fd = remote.infallible_syscall(syscall_number_for_openat(arch()),
-                                         RR_RESERVED_ROOT_DIR_FD, name.get(),
-                                         O_RDONLY | O_CLOEXEC);
-      if (fd != cloned_file_data_fd_child) {
-        long ret =
-            remote.infallible_syscall(syscall_number_for_dup3(arch()), fd,
-                                      cloned_file_data_fd_child, O_CLOEXEC);
-        ASSERT(this, ret == cloned_file_data_fd_child);
-        remote.infallible_syscall(syscall_number_for_close(arch()), fd);
-      }
-      fds->add_monitor(cloned_file_data_fd_child, new PreserveFileMonitor());
+      cloned_file_data_fname = trace_reader().file_data_clone_file_name(tuid());
+      ScopedFd clone_file(cloned_file_data_fname.c_str(), O_RDONLY);
+      ASSERT(this, clone_file.is_open());
+      remote.infallible_send_fd_dup(clone_file, cloned_file_data_fd_child, O_CLOEXEC);
+      fds->add_monitor(this, cloned_file_data_fd_child, new PreserveFileMonitor());
     }
   }
 
@@ -69,8 +63,8 @@ void ReplayTask::init_buffers(remote_ptr<void> map_hint) {
   RR_ARCH_FUNCTION(init_buffers_arch, arch(), map_hint);
 }
 
-void ReplayTask::post_exec_syscall(const string& replay_exe) {
-  Task::post_exec(replay_exe);
+void ReplayTask::post_exec_syscall(const string& replay_exe, const string& original_replay_exe) {
+  Task::post_exec(replay_exe, original_replay_exe);
 
   // Perform post-exec-syscall tasks now (e.g. opening mem_fd) before we
   // switch registers. This lets us perform AutoRemoteSyscalls using the
@@ -92,6 +86,10 @@ void ReplayTask::validate_regs(uint32_t flags) {
   /* don't validate anything before execve is done as the actual
    * process did not start prior to this point */
   if (!session().done_initial_exec()) {
+    return;
+  }
+  if (seen_sched_in_syscallbuf_syscall_hook) {
+    /* Registers may diverge here */
     return;
   }
 
@@ -157,6 +155,21 @@ void ReplayTask::set_real_tid_and_update_serial(pid_t tid) {
   hpc.set_tid(tid);
   this->tid = tid;
   serial = session().next_task_serial();
+}
+
+bool ReplayTask::post_vm_clone(CloneReason reason, int flags, Task* origin) {
+  if (Task::post_vm_clone(reason, flags, origin) &&
+      reason == TRACEE_CLONE &&
+      trace_reader().preload_thread_locals_recorded()) {
+    // Consume the mapping.
+    TraceReader::MappedData data;
+    KernelMapping km = trace_reader().read_mapped_region(&data);
+    ASSERT(this, km.start() == AddressSpace::preload_thread_locals_start() &&
+           km.size() == page_size());
+    return true;
+  }
+
+  return false;
 }
 
 } // namespace rr

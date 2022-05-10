@@ -1,11 +1,9 @@
 /* -*- Mode: C++; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-//#define FIRST_INTERESTING_EVENT 10700
-//#define LAST_INTERESTING_EVENT 10900
-
 #include "util.h"
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <elf.h>
 #include <execinfo.h>
 #include <fcntl.h>
@@ -14,6 +12,7 @@
 #include <linux/capability.h>
 #include <linux/magic.h>
 #include <linux/prctl.h>
+#include <math.h>
 #include <netinet/in.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,12 +20,16 @@
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
+#include <sys/uio.h>
 #include <sys/vfs.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <fstream>
 #include <string>
+#include <numeric>
+#include <random>
+#include <sstream>
 
 #include "preload/preload_interface.h"
 
@@ -35,6 +38,7 @@
 #include "Flags.h"
 #include "PerfCounters.h"
 #include "ReplaySession.h"
+#include "RecordTask.h"
 #include "ReplayTask.h"
 #include "TraceStream.h"
 #include "core.h"
@@ -49,7 +53,7 @@ using namespace std;
 
 namespace rr {
 
-template <typename Arch> static vector<uint8_t> read_auxv_arch(Task* t) {
+template <typename Arch> static remote_ptr<typename Arch::unsigned_word> env_ptr(Task* t) {
   auto stack_ptr = t->regs().sp().cast<typename Arch::unsigned_word>();
 
   auto argc = t->read_mem(stack_ptr);
@@ -59,6 +63,11 @@ template <typename Arch> static vector<uint8_t> read_auxv_arch(Task* t) {
   auto null_ptr = t->read_mem(stack_ptr);
   ASSERT(t, null_ptr == 0);
   stack_ptr++;
+  return stack_ptr;
+}
+
+template <typename Arch> remote_ptr<typename Arch::unsigned_word> auxv_ptr(Task* t) {
+  auto stack_ptr = env_ptr<Arch>(t);
 
   // Should now point to envp
   while (0 != t->read_mem(stack_ptr)) {
@@ -66,7 +75,11 @@ template <typename Arch> static vector<uint8_t> read_auxv_arch(Task* t) {
   }
   stack_ptr++;
   // should now point to ELF Auxiliary Table
+  return stack_ptr;
+}
 
+template <typename Arch>
+static vector<uint8_t> read_auxv_arch(Task* t, remote_ptr<typename Arch::unsigned_word> stack_ptr) {
   vector<uint8_t> result;
   while (true) {
     auto pair_vec = t->read_mem(stack_ptr, 2);
@@ -81,8 +94,90 @@ template <typename Arch> static vector<uint8_t> read_auxv_arch(Task* t) {
   return result;
 }
 
+template <typename Arch> static vector<uint8_t> read_auxv_arch(Task* t) {
+  auto stack_ptr = auxv_ptr<Arch>(t);
+  return read_auxv_arch<Arch>(t, stack_ptr);
+}
+
 vector<uint8_t> read_auxv(Task* t) {
   RR_ARCH_FUNCTION(read_auxv_arch, t->arch(), t);
+}
+
+remote_ptr<void> read_interpreter_base(std::vector<uint8_t> auxv) {
+  if (auxv.size() == 0 || (auxv.size() % sizeof(uint64_t) != 0)) {
+    // Corrupted or missing auxv
+    return nullptr;
+  }
+  remote_ptr<void> interpreter_base = nullptr;
+  for (size_t i = 0; i < (auxv.size() / sizeof(uint64_t)) - 1; i += 2) {
+    uint64_t* entry = ((uint64_t*)auxv.data())+i;
+    uint64_t kind = entry[0];
+    uint64_t value = entry[1];
+    if (kind == AT_BASE) {
+      interpreter_base = value;
+      break;
+    }
+  }
+  return interpreter_base;
+}
+
+std::string read_ld_path(Task* t, remote_ptr<void> interpreter_base) {
+  if (!interpreter_base) {
+    return {};
+  }
+  // Find first executable mapping after the interpreter_base and use its fsname().
+  // Non-executable maps may not have a file name.
+  remote_ptr<void> addr = interpreter_base;
+  while (true) {
+    if (!t->vm()->has_mapping(addr)) {
+      return {};
+    }
+    const KernelMapping& map = t->vm()->mapping_of(addr).map;
+    if (map.prot() & PROT_EXEC) {
+      return map.fsname();
+    }
+    addr = map.end();
+  }
+}
+
+template <typename Arch> void patch_auxv_vdso_arch(RecordTask* t, uintptr_t search, uintptr_t new_entry_native) {
+  auto stack_ptr = auxv_ptr<Arch>(t);
+  std::vector<uint8_t> v = read_auxv_arch<Arch>(t, stack_ptr);
+  size_t wsize = sizeof(typename Arch::unsigned_word);
+  for (int i = 0; (i + 1)*wsize*2 <= v.size(); ++i) {
+    if (*((typename Arch::unsigned_word*)(v.data() + i*2*wsize)) == search) {
+      auto entry_ptr = stack_ptr + i*2 + 1;
+      typename Arch::unsigned_word new_entry = new_entry_native;
+      t->write_mem(entry_ptr, new_entry);
+      t->record_local(entry_ptr, &new_entry);
+      return;
+    }
+  }
+  return;
+}
+
+void patch_auxv_vdso(RecordTask* t, uintptr_t search, uintptr_t new_entry) {
+  RR_ARCH_FUNCTION(patch_auxv_vdso_arch, t->arch(), t, search, new_entry);
+}
+
+template <typename Arch> static vector<string> read_env_arch(Task* t) {
+  auto stack_ptr = env_ptr<Arch>(t);
+
+  // Should now point to envp
+  vector<string> result;
+  while (true) {
+    auto p = t->read_mem(stack_ptr);
+    stack_ptr++;
+    if (!p) {
+      break;
+    }
+    result.push_back(t->read_c_str(remote_ptr<char>(p)));
+  }
+  return result;
+}
+
+vector<string> read_env(Task* t) {
+  RR_ARCH_FUNCTION(read_env_arch, t->arch(), t);
 }
 
 // FIXME this function assumes that there's only one address space.
@@ -285,7 +380,7 @@ static bool checksum_segment_filter(const AddressSpace::Mapping& m) {
   static const char mmap_clone[] = "mmap_clone_";
   may_diverge =
       m.map.fsname().substr(0, array_length(mmap_clone) - 1) != mmap_clone &&
-      (should_copy_mmap_region(m.map, st) || (PROT_WRITE & m.map.prot()));
+      (should_copy_mmap_region(m.map, m.map.fsname(), st) || (PROT_WRITE & m.map.prot()));
   LOG(debug) << (may_diverge ? "CHECKSUMMING" : "  skipping") << " '"
              << m.map.fsname() << "'";
   return may_diverge;
@@ -395,6 +490,9 @@ static void iterate_checksums(Task* t, ChecksumMode mode,
         FATAL() << "Segment " << parsed.start << "-" << parsed.end
                 << " changed to " << m.map << "??";
       }
+      // As |m| may have changed in the above for loop we need to update the
+      // |raw_map_line| too.
+      raw_map_line = m.map.str();
       ASSERT(t, m.map.end() == parsed.end)
           << "Segment " << parsed.start << "-" << parsed.end
           << " changed to " << m.map << "??";
@@ -481,6 +579,11 @@ static void iterate_checksums(Task* t, ChecksumMode mode,
 }
 
 bool should_checksum(const Event& event, FrameTime time) {
+  FrameTime checksum = Flags::get().checksum;
+  if (Flags::CHECKSUM_NONE == checksum) {
+    return false;
+  }
+
   if (event.type() == EV_EXIT) {
     // Task is dead, or at least detached, and we can't read its memory safely.
     return false;
@@ -491,18 +594,13 @@ bool should_checksum(const Event& event, FrameTime time) {
     return false;
   }
 
-  FrameTime checksum = Flags::get().checksum;
-  bool is_syscall_exit =
-      EV_SYSCALL == event.type() && EXITING_SYSCALL == event.Syscall().state;
-
-  if (Flags::CHECKSUM_NONE == checksum) {
-    return false;
-  }
   if (Flags::CHECKSUM_ALL == checksum) {
-    return true;
+    // Don't checksum at syscall entry because we sometimes mutate syscall parameters there
+    // and that will cause false divergence
+    return EV_SYSCALL != event.type() || ENTERING_SYSCALL != event.Syscall().state;
   }
   if (Flags::CHECKSUM_SYSCALL == checksum) {
-    return is_syscall_exit;
+    return EV_SYSCALL == event.type() && EXITING_SYSCALL == event.Syscall().state;
   }
   /* |checksum| is a global time point. */
   return checksum <= time;
@@ -601,24 +699,20 @@ SignalDeterministic is_deterministic_signal(Task* t) {
   }
 }
 
-static bool has_fs_name(const string& path) {
-  struct stat dummy;
-  return 0 == stat(path.c_str(), &dummy);
-}
-
-static bool is_tmp_file(const string& path) {
+static bool is_tmp_file(const ScopedFd &fd, const string &tracee_path) {
   if (getenv("RR_TRUST_TEMP_FILES")) {
     return false;
   }
   struct statfs sfs;
-  statfs(path.c_str(), &sfs);
-  return (TMPFS_MAGIC == sfs.f_type
+  int ret = fstatfs(fd.get(), &sfs);
+  return ((ret == 0 && TMPFS_MAGIC == sfs.f_type)
           // In observed configurations of Ubuntu 13.10, /tmp is
           // a folder in the / fs, not a separate tmpfs.
-          || path.c_str() == strstr(path.c_str(), "/tmp/"));
+          || tracee_path.c_str() == strstr(tracee_path.c_str(), "/tmp/"));
 }
 
 bool should_copy_mmap_region(const KernelMapping& mapping,
+                             const string &file_name,
                              const struct stat& stat) {
   if (getenv("RR_COPY_ALL_FILES")) {
     return true;
@@ -626,14 +720,21 @@ bool should_copy_mmap_region(const KernelMapping& mapping,
 
   int flags = mapping.flags();
   int prot = mapping.prot();
-  const string& file_name = mapping.fsname();
   bool private_mapping = (flags & MAP_PRIVATE);
+
+  // file_name may point into proc, since we may not have direct access to
+  // the file. Open it, so we can perform the various queries we'd like to ask.
+  ScopedFd fd(file_name.c_str(), O_RDONLY);
 
   // TODO: handle mmap'd files that are unlinked during
   // recording or otherwise not available.
-  if (!has_fs_name(file_name)) {
+  if (!fd.is_open()) {
     // This includes files inaccessible because the tracee is using a different
     // mount namespace with its own mounts
+    // It's also possible for a tracee to mmap a file it doesn't have permission
+    // to read, e.g. if a daemon opened the file and passed the fd over a
+    // socket. We should copy the data now because we won't be able to read
+    // it later. nscd does this.
     LOG(debug) << "  copying unlinked/inaccessible file";
     return true;
   }
@@ -641,18 +742,25 @@ bool should_copy_mmap_region(const KernelMapping& mapping,
     LOG(debug) << "  copying non-regular-file";
     return true;
   }
-  if (is_tmp_file(file_name)) {
+  if (is_tmp_file(fd, mapping.fsname())) {
     LOG(debug) << "  copying file on tmpfs";
     return true;
   }
-  if (file_name == "/etc/ld.so.cache") {
+  if (mapping.fsname() == "/etc/ld.so.cache") {
     // This file changes on almost every system update so we should copy it.
-    LOG(debug) << "  copying " << file_name;
+    LOG(debug) << "  copying " << mapping.fsname();
+    return true;
+  }
+  if (mapping.fsname().rfind("/etc/passwd", 0) == 0 ||
+      mapping.fsname().rfind("/etc/group", 0) == 0) {
+    // These files (and suffixes such as .cache etc) change very frequently in
+    // some environments.
+    LOG(debug) << "  copying " << mapping.fsname();
     return true;
   }
   if (private_mapping && (prot & PROT_EXEC)) {
     /* Be optimistic about private executable mappings */
-    LOG(debug) << "  (no copy for +x private mapping " << file_name << ")";
+    LOG(debug) << "  (no copy for +x private mapping " << mapping.fsname() << ")";
     return false;
   }
   if (private_mapping && (0111 & stat.st_mode)) {
@@ -661,16 +769,8 @@ bool should_copy_mmap_region(const KernelMapping& mapping,
      * Since we're already assuming those change very
      * infrequently, we can avoid copying the data
      * sections too. */
-    LOG(debug) << "  (no copy for private mapping of +x " << file_name << ")";
+    LOG(debug) << "  (no copy for private mapping of +x " << mapping.fsname() << ")";
     return false;
-  }
-  bool can_read_file = (0 == access(file_name.c_str(), R_OK));
-  if (!can_read_file) {
-    // It's possible for a tracee to mmap a file it doesn't have permission
-    // to read, e.g. if a daemon opened the file and passed the fd over a
-    // socket. We should copy the data now because we won't be able to read
-    // it later. nscd does this.
-    return true;
   }
 
   // TODO: using "can the euid of the rr process write this
@@ -740,7 +840,11 @@ bool xsave_enabled() {
   return (features.ecx & OSXSAVE_FEATURE_FLAG) != 0;
 }
 
+
+#define FATAL_X86_ONLY() FATAL() << "Reached x86-only code on non-x86 arch"
+
 uint64_t xcr0() {
+#if defined(__i386__) || defined(__x86_64__)
   if (!xsave_enabled()) {
     // Assume x87/SSE enabled.
     return 3;
@@ -750,8 +854,13 @@ uint64_t xcr0() {
                : "=a"(eax), "=d"(edx)
                : "c"(0));
   return (uint64_t(edx) << 32) | eax;
+#else
+  FATAL_X86_ONLY();
+  return 0;
+#endif
 }
 
+#if defined(__i386__) || defined(__x86_64__)
 CPUIDData cpuid(uint32_t code, uint32_t subrequest) {
   CPUIDData result;
   asm volatile("cpuid"
@@ -760,27 +869,45 @@ CPUIDData cpuid(uint32_t code, uint32_t subrequest) {
                : "a"(code), "c"(subrequest));
   return result;
 }
+#else
+CPUIDData cpuid(uint32_t, uint32_t) {
+  FATAL_X86_ONLY();
+  __builtin_unreachable();
+}
+#endif
+
 
 #define SEGV_HANDLER_MAGIC 0x98765432
 
 static void cpuid_segv_handler(__attribute__((unused)) int sig,
                                __attribute__((unused)) siginfo_t* si,
                                void* user) {
-  ucontext_t* ctx = (ucontext_t*)user;
 #if defined(__i386__)
+  ucontext_t* ctx = (ucontext_t*)user;
   ctx->uc_mcontext.gregs[REG_EIP] += 2;
   ctx->uc_mcontext.gregs[REG_EAX] = SEGV_HANDLER_MAGIC;
 #elif defined(__x86_64__)
+  ucontext_t* ctx = (ucontext_t*)user;
   ctx->uc_mcontext.gregs[REG_RIP] += 2;
   ctx->uc_mcontext.gregs[REG_RAX] = SEGV_HANDLER_MAGIC;
 #else
-#error unknown architecture
+  (void)user;
+  FATAL_X86_ONLY();
 #endif
 }
 
 static CPUIDRecord cpuid_record(uint32_t eax, uint32_t ecx) {
   CPUIDRecord result = { eax, ecx, cpuid(eax, ecx) };
   return result;
+}
+
+bool is_cpu_vendor_amd(CPUIDData vendor_string)
+{
+  char vendor[12];
+  memcpy(&vendor[0], &vendor_string.ebx, 4);
+  memcpy(&vendor[4], &vendor_string.edx, 4);
+  memcpy(&vendor[8], &vendor_string.ecx, 4);
+  return strncmp(vendor, "AuthenticAMD", sizeof(vendor)) == 0;
 }
 
 static vector<CPUIDRecord> gather_cpuid_records(uint32_t up_to) {
@@ -905,11 +1032,30 @@ static vector<CPUIDRecord> gather_cpuid_records(uint32_t up_to) {
     return results;
   }
 
+  bool is_amd = is_cpu_vendor_amd(vendor_string.out);
+
   CPUIDRecord extended_info = cpuid_record(CPUID_INTELEXTENDED, UINT32_MAX);
   results.push_back(extended_info);
-  int extended_info_max = min(up_to, extended_info.out.eax);
-  for (int extended = CPUID_INTELEXTENDED + 1; extended <= extended_info_max;
+  uint32_t extended_info_max = min(up_to, extended_info.out.eax);
+  for (uint32_t extended = CPUID_INTELEXTENDED + 1; extended <= extended_info_max;
        ++extended) {
+    if (is_amd) {
+      if (extended == CPUID_AMD_CACHE_TOPOLOGY) {
+        for (int level = 0;; ++level) {
+          CPUIDRecord rec = cpuid_record(extended, level);
+          results.push_back(rec);
+          if (!(rec.out.eax & 0x1f)) {
+            // CacheType: null, no more caches
+            break;
+          }
+        }
+        continue;
+      } else if (extended == CPUID_AMD_PLATFORM_QOS) {
+        cpuid_record(extended, 0);
+        cpuid_record(extended, 1);
+        continue;
+      }
+    }
     results.push_back(cpuid_record(extended, UINT32_MAX));
   }
 
@@ -936,7 +1082,7 @@ bool cpuid_faulting_works() {
   did_check_cpuid_faulting = true;
 
   // Test to see if CPUID faulting works.
-  if (RR_ARCH_PRCTL(ARCH_SET_CPUID, 0) != 0) {
+  if (RR_ARCH_PRCTL(ARCH_SET_CPUID, 0L) != 0) {
     LOG(debug) << "CPUID faulting not supported by kernel/hardware";
     return false;
   }
@@ -963,7 +1109,7 @@ bool cpuid_faulting_works() {
   if (sigaction(SIGSEGV, &old_sa, NULL) < 0) {
     FATAL() << "Can't restore sighandler";
   }
-  if (RR_ARCH_PRCTL(ARCH_SET_CPUID, 1) < 0) {
+  if (RR_ARCH_PRCTL(ARCH_SET_CPUID, 1L) < 0) {
     FATAL() << "Can't restore ARCH_SET_CPUID";
   }
   return cpuid_faulting_ok;
@@ -994,6 +1140,48 @@ bool cpuid_compatible(const vector<CPUIDRecord>& trace_records) {
   return cpu_type == trace_cpu_type;
 }
 
+bool cpu_has_xsave_fip_fdp_quirk() {
+  CPUIDData features = cpuid(CPUID_GETFEATURES, 0);
+  if ((features.ecx & XSAVE_FEATURE_FLAG) == 0) {
+    return false;
+  }
+#if defined(__i386__) || defined(__x86_64__)
+  uint64_t xsave_buf[576/sizeof(uint64_t)] __attribute__((aligned(64)));
+  xsave_buf[1] = 0;
+  asm volatile("finit\n"
+               "fld1\n"
+#if defined(__x86_64__)
+               "xsave64 %0\n"
+#else
+               "xsave %0\n"
+#endif
+               : "=m"(xsave_buf)
+               : "a"(1), "d"(0)
+               : "memory");
+  return !xsave_buf[1];
+#else
+  FATAL_X86_ONLY();
+  return false;
+#endif
+}
+
+bool cpu_has_fdp_exception_only_quirk() {
+#if defined(__i386__) || defined(__x86_64__)
+  uint32_t fenv_buf[7];
+  fenv_buf[5] = 0;
+  asm volatile("finit\n"
+               "fld1\n"
+               "fstenv %0\n"
+               : "=m"(fenv_buf)
+               :
+               : "memory");
+  return !fenv_buf[5];
+#else
+  FATAL_X86_ONLY();
+  return false;
+#endif
+}
+
 template <typename Arch>
 static CloneParameters extract_clone_parameters_arch(const Registers& regs) {
   CloneParameters result;
@@ -1009,10 +1197,10 @@ static CloneParameters extract_clone_parameters_arch(const Registers& regs) {
       result.ctid = regs.arg4();
       break;
   }
-  int flags = (int)regs.arg1();
+  int flags = (int)regs.orig_arg1();
   // If these flags aren't set, the corresponding clone parameters may be
   // invalid pointers, so make sure they're ignored.
-  if (!(flags & CLONE_PARENT_SETTID)) {
+  if (!(flags & (CLONE_PARENT_SETTID | CLONE_PIDFD))) {
     result.ptid = nullptr;
   }
   if (!(flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID))) {
@@ -1090,9 +1278,13 @@ static string read_exe_dir() {
   return exe_path;
 }
 
-string exe_directory() {
-  static string exe_path = read_exe_dir();
-  return exe_path;
+string resource_path() {
+  string resource_path = Flags::get().resource_path;
+  if (resource_path.empty()) {
+    static string exe_path = read_exe_dir() + "../";
+    return exe_path;
+  }
+  return resource_path;
 }
 
 /**
@@ -1105,14 +1297,49 @@ double monotonic_now_sec() {
   return (double)tp.tv_sec + (double)tp.tv_nsec / 1e9;
 }
 
-bool running_under_rr() { return getenv("RUNNING_UNDER_RR") != NULL; }
+bool running_under_rr(bool cache) {
+  static bool rr_under_rr = false;
+  static bool rr_check_done = false;
+  if (!rr_check_done || !cache) {
+    rr_check_done = true;
+    int ret = syscall(SYS_rrcall_check_presence, (uintptr_t)0, (uintptr_t)0,
+      (uintptr_t)0, (uintptr_t)0, (uintptr_t)0, (uintptr_t)0);
+    if (ret > 0 || (ret < 0 && errno != ENOSYS)) {
+      FATAL() << "Unexpected result for rrcall_check_presence: " << ret;
+    }
+    rr_under_rr = ret == 0;
+  }
+  return rr_under_rr;
+}
+
+string find_helper_library(const char *basepath)
+{
+  string lib_path = resource_path() + "lib64/rr/";
+  string file_name = lib_path + basepath;
+  if (access(file_name.c_str(), F_OK) == 0) {
+    return lib_path;
+  }
+  lib_path = resource_path() + "lib/rr/";
+  file_name = lib_path + basepath;
+  if (access(file_name.c_str(), F_OK) == 0) {
+    return lib_path;
+  }
+  // File does not exist. Assume install put it in LD_LIBRARY_PATH.
+  lib_path = "";
+  return lib_path;
+}
 
 vector<string> read_proc_status_fields(pid_t tid, const char* name,
                                        const char* name2, const char* name3) {
   vector<string> result;
+  FILE *f;
   char buf[1000];
-  sprintf(buf, "/proc/%d/status", tid);
-  FILE* f = fopen(buf, "r");
+  if (tid == 0) {
+    f = fopen("/proc/self/status", "r");
+  } else {
+    sprintf(buf, "/proc/%d/status", tid);
+    f = fopen(buf, "r");
+  }
   if (!f) {
     return result;
   }
@@ -1147,11 +1374,6 @@ vector<string> read_proc_status_fields(pid_t tid, const char* name,
   return result;
 }
 
-bool is_zombie_process(pid_t pid) {
-  auto state = read_proc_status_fields(pid, "State");
-  return state.empty() || state[0].empty() || state[0][0] == 'Z';
-}
-
 static bool check_for_pax_kernel() {
   auto results = read_proc_status_fields(getpid(), "PaX");
   return !results.empty();
@@ -1162,8 +1384,208 @@ bool uses_invisible_guard_page() {
   return !is_pax_kernel;
 }
 
+bool read_proc_net_socket_addresses(Task* t, int fd,
+                                    std::array<typename NativeArch::sockaddr_storage, 2> &out) {
+  char buf[1000];
+
+  auto stat = t->stat_fd(fd);
+  ino_t inode = stat.st_ino;
+
+  // Check tcp first.
+  if (FILE* f = fopen("/proc/net/tcp", "r")) {
+    // Skip the first line, which contains human-readable column labels.
+    if (!fgets(buf, sizeof(buf) - 1, f)) {
+      LOG(warn) << "Can't read /proc/net/tcp";
+    }
+    while (fgets(buf, sizeof(buf) - 1, f)) {
+      // Ignore the first field.
+      strtok(buf, " ");
+      // Then come the local and remote addresses.
+      char* local_addr_str = strtok(NULL, " ");
+      char* remote_addr_str = strtok(NULL, " ");
+      // Then six more fields to ignore.
+      strtok(NULL, " ");
+      strtok(NULL, " ");
+      strtok(NULL, " ");
+      strtok(NULL, " ");
+      strtok(NULL, " ");
+      strtok(NULL, " ");
+      // Finally the inode
+      char* ino = strtok(NULL, " ");
+      ino_t inod = strtoull(ino, NULL, 10);
+      if (inod != inode) {
+        continue;
+      }
+
+      // We have a match.
+      char* next = NULL;
+      unsigned long laddr = strtoul(local_addr_str, &next, 16);
+      if ((laddr == ULONG_MAX && errno == ERANGE) || *next != ':') {
+        LOG(warn) << "Local address not in expected format";
+        break;
+      }
+      ++next;
+      unsigned long lport = strtoul(next, NULL, 16);
+      if (lport > USHRT_MAX) {
+        LOG(warn) << "Local address not in expected format";
+        break;
+      }
+      struct sockaddr_in* local_addr_in = (struct sockaddr_in*)&out[0];
+      local_addr_in->sin_family = AF_INET;
+      local_addr_in->sin_addr.s_addr = laddr;
+      local_addr_in->sin_port = lport;
+      unsigned long raddr = strtoul(remote_addr_str, &next, 16);
+      if ((raddr == ULONG_MAX && errno == ERANGE) || *next != ':') {
+        LOG(warn) << "Remote address not in expected format";
+        break;
+      }
+      ++next;
+      unsigned long rport = strtoul(next, NULL, 16);
+      if (rport > USHRT_MAX) {
+        LOG(warn) << "Remote address not in expected format";
+        break;
+      }
+      struct sockaddr_in* remote_addr_in = (struct sockaddr_in*)&out[1];
+      remote_addr_in->sin_family = AF_INET;
+      remote_addr_in->sin_addr.s_addr = raddr;
+      remote_addr_in->sin_port = rport;
+      fclose(f);
+      return true;
+    }
+    fclose(f);
+  } else {
+    LOG(warn) << "Can't open /proc/net/tcp";
+  }
+
+  // Then tcp6
+  if (FILE* f = fopen("/proc/net/tcp6", "r")) {
+    // Skip the first line, which contains human-readable column labels.
+    if (!fgets(buf, sizeof(buf) - 1, f)) {
+      LOG(warn) << "Can't read /proc/net/tcp6";
+    }
+    while (fgets(buf, sizeof(buf) - 1, f)) {
+      // Ignore the first field.
+      strtok(buf, " ");
+      // Then come the local and remote addresses.
+      char* local_addr_str = strtok(NULL, " ");
+      char* remote_addr_str = strtok(NULL, " ");
+      // Then six more fields to ignore.
+      strtok(NULL, " ");
+      strtok(NULL, " ");
+      strtok(NULL, " ");
+      strtok(NULL, " ");
+      strtok(NULL, " ");
+      strtok(NULL, " ");
+      // Finally the inode
+      char* ino = strtok(NULL, " ");
+      ino_t inod = strtoull(ino, NULL, 10);
+      if (inod != inode) {
+        continue;
+      }
+
+      // We have a match.
+      struct sockaddr_in6* local_addr_in6 = (struct sockaddr_in6*)&out[0];
+      local_addr_in6->sin6_family = AF_INET6;
+
+      if (strlen(local_addr_str) != 37) {
+        break;
+      }
+      char buf[9];
+      for (int i = 0; i < 4; ++i) {
+        char* c = local_addr_str + i * 8;
+        strncpy(buf, c, 8);
+        buf[8] = '\0';
+        unsigned long local_addr_component = strtoul(buf, NULL, 16);
+        if ((local_addr_component == ULONG_MAX && errno == ERANGE)) {
+          LOG(warn) << "Local address not in expected format";
+          break;
+        }
+        local_addr_in6->sin6_addr.s6_addr32[i] = local_addr_component;
+      }
+      if (*(local_addr_str + 32) != ':') {
+        LOG(warn) << "Local address not in expected format";
+        break;
+      }
+      unsigned long lport = strtoul(local_addr_str + 33, NULL, 16);
+      if (lport > USHRT_MAX) {
+        LOG(warn) << "Local address not in expected format";
+        break;
+      }
+      local_addr_in6->sin6_port = lport;
+
+      struct sockaddr_in6* remote_addr_in6 = (struct sockaddr_in6*)&out[1];
+      remote_addr_in6->sin6_family = AF_INET6;
+
+      if (strlen(remote_addr_str) != 37) {
+        break;
+      }
+      for (int i = 0; i < 4; ++i) {
+        char* c = remote_addr_str + 24 - i * 8;
+        strncpy(buf, c, 8);
+        buf[8] = '\0';
+        unsigned long remote_addr_component = strtoul(buf, NULL, 16);
+        if ((remote_addr_component == ULONG_MAX && errno == ERANGE)) {
+          LOG(warn) << "Remote address not in expected format";
+          break;
+        }
+        remote_addr_in6->sin6_addr.s6_addr32[i] = remote_addr_component;
+      }
+      if (*(remote_addr_str + 32) != ':') {
+        LOG(warn) << "Remote address not in expected format";
+        break;
+      }
+      unsigned long rport = strtoul(remote_addr_str + 33, NULL, 16);
+      if (rport > USHRT_MAX) {
+        LOG(warn) << "Remote address not in expected format";
+        break;
+      }
+      remote_addr_in6->sin6_port = rport;
+      fclose(f);
+      return true;
+    }
+    fclose(f);
+  } else {
+    LOG(warn) << "Can't open /proc/net/tcp6";
+  }
+
+  return false;
+}
+
+static bool try_copy_file_by_copy_all(int dest_fd, int src_fd)
+{
+  static bool should_try_copy_all = true;
+  if (!should_try_copy_all) {
+    return false;
+  }
+  struct stat src_stat;
+  if (0 != fstat(src_fd, &src_stat)) {
+    return false;
+  }
+  size_t remaining_size = src_stat.st_size;
+  while (remaining_size > 0) {
+    ssize_t ncopied = syscall(NativeArch::copy_file_range, src_fd, NULL,
+                              dest_fd, NULL, remaining_size, 0);
+    if (ncopied == -1) {
+      if (errno == ENOSYS) {
+        should_try_copy_all = false;
+      }
+      return false;
+    }
+    if (ncopied == 0) {
+      // This doesn't necessarily mean EOF - some file systems don't like this
+      // system call.
+      return false;
+    }
+    remaining_size -= ncopied;
+  }
+  return true;
+}
+
 bool copy_file(int dest_fd, int src_fd) {
   char buf[32 * 1024];
+  if (try_copy_file_by_copy_all(dest_fd, src_fd)) {
+    return true;
+  }
   while (1) {
     ssize_t bytes_read = read(src_fd, buf, sizeof(buf));
     if (bytes_read < 0) {
@@ -1175,14 +1597,6 @@ bool copy_file(int dest_fd, int src_fd) {
     write_all(dest_fd, buf, bytes_read);
   }
   return true;
-}
-
-void* xmalloc(size_t size) {
-  void* mem_ptr = malloc(size);
-  if (!mem_ptr) {
-    notifying_abort();
-  }
-  return mem_ptr;
 }
 
 bool has_effective_caps(uint64_t caps) {
@@ -1251,11 +1665,6 @@ XSaveLayout xsave_layout_from_trace(const std::vector<CPUIDRecord> records) {
   return layout;
 }
 
-uint64_t rr_signal_mask() {
-  return signal_bit(PerfCounters::TIME_SLICE_SIGNAL) |
-         signal_bit(SYSCALLBUF_DESCHED_SIGNAL);
-}
-
 ScopedFd open_socket(const char* address, unsigned short* port,
                      ProbePort probe) {
   ScopedFd listen_fd(socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0));
@@ -1276,27 +1685,39 @@ ScopedFd open_socket(const char* address, unsigned short* port,
   do {
     addr.sin_port = htons(*port);
     ret = ::bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr));
-    if (ret && (EADDRINUSE == errno || EACCES == errno || EINVAL == errno)) {
+    if (ret && probe == PROBE_PORT && (EADDRINUSE == errno || EACCES == errno || EINVAL == errno)) {
+      *port = 0;
       continue;
     }
     if (ret) {
-      FATAL() << "Couldn't bind to port " << *port;
+      CLEAN_FATAL() << "Couldn't bind to port " << *port;
     }
 
     ret = listen(listen_fd, 1 /*backlogged connection*/);
-    if (ret && EADDRINUSE == errno) {
+    if (ret && probe == PROBE_PORT && EADDRINUSE == errno) {
+      *port = 0;
       continue;
     }
     if (ret) {
       FATAL() << "Couldn't listen on port " << *port;
     }
+    if (*port == 0) {
+      socklen_t sa_size = sizeof(addr);
+      ret = getsockname(listen_fd, (struct sockaddr*)&addr, &sa_size);
+      if (ret) {
+        FATAL() << "Could not get socket port";
+      }
+
+      *port = ntohs(addr.sin_port);
+    }
     break;
-  } while (++(*port), probe == PROBE_PORT);
+  } while (probe == PROBE_PORT);
   return listen_fd;
 }
 
 void notifying_abort() {
   flush_log_buffer();
+  dump_rr_stack();
 
   char* test_monitor_pid = getenv("RUNNING_UNDER_TEST_MONITOR");
   if (test_monitor_pid) {
@@ -1305,8 +1726,6 @@ void notifying_abort() {
     // do so.
     kill(pid, SIGURG);
     sleep(10000);
-  } else {
-    dump_rr_stack();
   }
 
   abort();
@@ -1323,7 +1742,7 @@ void dump_rr_stack() {
 }
 
 void check_for_leaks() {
-  if (getenv("RUNNING_UNDER_RR")) {
+  if (running_under_rr()) {
     // Don't do leak checking. The outer rr may have injected maps into our
     // address space that look like leaks to us.
     return;
@@ -1399,6 +1818,42 @@ TempFile create_temporary_file(const char* pattern) {
   return result;
 }
 
+static ScopedFd create_memfd_file(const string &real_name) {
+  ScopedFd fd(syscall(SYS_memfd_create, real_name.c_str(), 0));
+  return fd;
+}
+
+static void replace_char(string& s, char c, char replacement) {
+  size_t i = 0;
+  while (string::npos != (i = s.find(c, i))) {
+    s[i] = replacement;
+  }
+}
+
+// Used only when memfd_create is not available, i.e. Linux < 3.17
+static ScopedFd create_tmpfs_file(const string &real_name) {
+  std::string name = real_name;
+  replace_char(name, '/', '\\');
+  name = string(tmp_dir()) + '/' + name;
+  name = name.substr(0, 255);
+
+  ScopedFd fd =
+      open(name.c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0700);
+  /* Remove the fs name so that we don't have to worry about
+   * cleaning up this segment in error conditions. */
+  unlink(name.c_str());
+  return fd;
+}
+
+ScopedFd open_memory_file(const std::string &name)
+{
+  ScopedFd fd(create_memfd_file(name));
+  if (!fd.is_open()) {
+    fd = create_tmpfs_file(name);
+  }
+  return fd;
+}
+
 void good_random(void* out, size_t out_len) {
   ScopedFd fd("/dev/urandom", O_RDONLY);
   uint8_t* o = static_cast<uint8_t*>(out);
@@ -1427,29 +1882,53 @@ vector<string> current_env() {
 }
 
 int get_num_cpus() {
-  int cpus = (int)sysconf(_SC_NPROCESSORS_ONLN);
-  return cpus > 0 ? cpus : 1;
+  cpu_set_t affinity_mask;
+  int ret = sched_getaffinity(0, sizeof(affinity_mask), &affinity_mask);
+  if (ret < 0) {
+    FATAL() << "sched_getaffinity failed";
+  }
+  return CPU_COUNT(&affinity_mask);
 }
 
 static const uint8_t rdtsc_insn[] = { 0x0f, 0x31 };
 static const uint8_t rdtscp_insn[] = { 0x0f, 0x01, 0xf9 };
 static const uint8_t cpuid_insn[] = { 0x0f, 0xa2 };
+static const uint8_t int3_insn[] = { 0xcc };
+static const uint8_t pushf_insn[] = { 0x9c };
+static const uint8_t pushf16_insn[] = { 0x66, 0x9c };
 
+// XXX this probably needs to be extended to decode ignored prefixes
 TrappedInstruction trapped_instruction_at(Task* t, remote_code_ptr ip) {
   uint8_t insn[sizeof(rdtscp_insn)];
-  ssize_t len =
+  ssize_t ret =
       t->read_bytes_fallible(ip.to_data_ptr<uint8_t>(), sizeof(insn), insn);
-  if ((size_t)len >= sizeof(rdtsc_insn) &&
+  if (ret < 0) {
+    return TrappedInstruction::NONE;
+  }
+  size_t len = ret;
+  if (len >= sizeof(rdtsc_insn) &&
       !memcmp(insn, rdtsc_insn, sizeof(rdtsc_insn))) {
     return TrappedInstruction::RDTSC;
   }
-  if ((size_t)len >= sizeof(rdtscp_insn) &&
+  if (len >= sizeof(rdtscp_insn) &&
       !memcmp(insn, rdtscp_insn, sizeof(rdtscp_insn))) {
     return TrappedInstruction::RDTSCP;
   }
-  if ((size_t)len >= sizeof(cpuid_insn) &&
+  if (len >= sizeof(cpuid_insn) &&
       !memcmp(insn, cpuid_insn, sizeof(cpuid_insn))) {
     return TrappedInstruction::CPUID;
+  }
+  if (len >= sizeof(int3_insn) &&
+      !memcmp(insn, int3_insn, sizeof(int3_insn))) {
+    return TrappedInstruction::INT3;
+  }
+  if (len >= sizeof(pushf_insn) &&
+      !memcmp(insn, pushf_insn, sizeof(pushf_insn))) {
+    return TrappedInstruction::PUSHF;
+  }
+  if (len >= sizeof(pushf16_insn) &&
+      !memcmp(insn, pushf16_insn, sizeof(pushf16_insn))) {
+    return TrappedInstruction::PUSHF16;
   }
   return TrappedInstruction::NONE;
 }
@@ -1461,70 +1940,93 @@ size_t trapped_instruction_len(TrappedInstruction insn) {
     return sizeof(rdtscp_insn);
   } else if (insn == TrappedInstruction::CPUID) {
     return sizeof(cpuid_insn);
+  } else if (insn == TrappedInstruction::INT3) {
+    return sizeof(int3_insn);
+  } else if (insn == TrappedInstruction::PUSHF) {
+    return sizeof(pushf_insn);
+  } else if (insn == TrappedInstruction::PUSHF16) {
+    return sizeof(pushf16_insn);
   } else {
     return 0;
   }
 }
 
 /**
- * Read and parse the available CPU list then select a random CPU from the list.
+ * Certain instructions generate deterministic signals but also advance pc.
+ * Look *backwards* and see if this was one of them.
  */
-static int get_random_cpu_cgroup() {
-  ifstream self_cpuset("/proc/self/cpuset");
-  if (!self_cpuset.is_open()) {
-    return -1;
+bool is_advanced_pc_and_signaled_instruction(Task* t, remote_code_ptr ip) {
+#if defined(__i386__) || defined(__x86_64__)
+  uint8_t insn[sizeof(int3_insn)];
+  ssize_t ret =
+      t->read_bytes_fallible(ip.to_data_ptr<uint8_t>() - sizeof(insn), sizeof(insn), insn);
+  if (ret < 0) {
+    return false;
   }
-  string cpuset_path;
-  getline(self_cpuset, cpuset_path);
-  self_cpuset.close();
-  if (cpuset_path.empty()) {
-    return -1;
+  size_t len = ret;
+  if (len >= sizeof(int3_insn) &&
+      !memcmp(insn, int3_insn, sizeof(int3_insn))) {
+    return true;
   }
-  ifstream cpuset("/sys/fs/cgroup/cpuset" + cpuset_path + "/cpuset.cpus");
-  if (!cpuset.good()) {
-    return -1;
-  }
-  vector<int> cpus;
-  while (true) {
-    int cpu1;
-    cpuset >> cpu1;
-    if (cpuset.fail()) {
-      return -1;
-    }
-    cpus.push_back(cpu1);
-    char c = cpuset.get();
-    if (cpuset.eof() || c == '\n') {
-      break;
-    } else if (c == ',') {
-      continue;
-    } else if (c != '-') {
-      return -1;
-    }
-    int cpu2;
-    cpuset >> cpu2;
-    if (cpuset.fail()) {
-      return -1;
-    }
-    for (int cpu = cpu1 + 1; cpu <= cpu2; cpu++) {
-      cpus.push_back(cpu);
-    }
-    c = cpuset.get();
-    if (cpuset.eof() || c == '\n') {
-      break;
-    } else if (c != ',') {
-      return -1;
-    }
-  }
-  return cpus[random() % cpus.size()];
+#else
+  UNUSED(t);
+  UNUSED(ip);
+#endif
+  return false;
+}
+
+static string get_cpu_lock_file() {
+  const char* lock_file = getenv("_RR_CPU_LOCK_FILE");
+  return lock_file ? lock_file : trace_save_dir() + "/cpu_lock";
 }
 
 /**
  * Pick a CPU at random to bind to, unless --cpu-unbound has been given,
  * in which case we return -1.
  */
-int choose_cpu(BindCPU bind_cpu) {
+int choose_cpu(BindCPU bind_cpu, ScopedFd &cpu_lock_fd_out) {
   if (bind_cpu == UNBOUND_CPU) {
     return -1;
+  }
+
+  // Find out which CPUs we're allowed to run on at all.
+  // sched_getaffinity intersects the task's `cpu_mask`
+  // (/proc/.../status Cpus_allowed_list) with `cpu_active_mask`
+  // which is almost the same as /sys/devices/system/cpu/online
+  cpu_set_t affinity_mask;
+  int ret = sched_getaffinity(0, sizeof(affinity_mask), &affinity_mask);
+  if (ret < 0) {
+    FATAL() << "sched_getaffinity failed";
+  }
+  std::vector<int> cpus;
+  for (int i = 0; i < CPU_SETSIZE; ++i) {
+    if (CPU_ISSET(i, &affinity_mask)) {
+      cpus.push_back(i);
+    }
+  }
+  if (cpus.empty()) {
+    FATAL() << "Can't find a valid CPU to run on";
+  }
+
+  // When many copies of rr are running on the same machine, it's easy for them
+  // to oversubscribe a CPU. To avoid this situation, we have a lock file, where
+  // each running rr process will lock the n-th byte if it is running on that
+  // particular CPU. That way subsequent rr processes can avoid in-use cores
+  // if possible.
+  string cpu_lock_file = get_cpu_lock_file();
+  cpu_lock_fd_out = ScopedFd(cpu_lock_file.c_str(), O_CREAT | O_WRONLY | O_CLOEXEC, 0600);
+
+  // Make sure the locks file is big enough
+  if (cpu_lock_fd_out.is_open()) {
+    struct stat stat;
+    int err = fstat(cpu_lock_fd_out, &stat);
+    DEBUG_ASSERT(err == 0);
+    int configured_cpus = (int)sysconf(_SC_NPROCESSORS_CONF);
+    if (stat.st_size < configured_cpus) {
+      if (ftruncate(cpu_lock_fd_out, configured_cpus)) {
+        FATAL() << "Failed to resize locks file";
+      }
+    }
   }
 
   // Pin tracee tasks to a random logical CPU, both in
@@ -1542,14 +2044,50 @@ int choose_cpu(BindCPU bind_cpu) {
   // presumably due to cheaper context switching and/or
   // better interaction with CPU frequency scaling.
   if (bind_cpu >= 0) {
+    if (cpu_lock_fd_out.is_open()) {
+      struct flock lock {
+        .l_type = F_WRLCK,
+        .l_whence = SEEK_SET,
+        .l_start = bind_cpu,
+        .l_len = 1,
+        .l_pid = 0
+      };
+      // Try to acquire the lock for this CPU
+      (void)fcntl(cpu_lock_fd_out, F_SETLK, &lock);
+      // Ignore fcntl errors - nothing we can do
+    }
     return bind_cpu;
   }
 
-  int cpu = get_random_cpu_cgroup();
-  if (cpu >= 0) {
-    return cpu;
+  if (cpu_lock_fd_out.is_open()) {
+    // Try twice to allocate a CPU. If we fail twice, pick a random one
+    for (int i = 0; i < 2; ++i) {
+      std::shuffle (cpus.begin(), cpus.end(), std::default_random_engine(random()));
+      for (int cpu : cpus) {
+        struct flock lock {
+          .l_type = F_WRLCK,
+          .l_whence = SEEK_SET,
+          .l_start = cpu,
+          .l_len = 1,
+          .l_pid = 0
+        };
+        // Try to acquire the lock for this CPU
+        int err = fcntl(cpu_lock_fd_out, F_SETLK, &lock);
+        if (err == 0) {
+          return cpu;
+        }
+        else if (err == -1) {
+          if (errno != EACCES && errno != EAGAIN) {
+            FATAL() << "Unexpected error trying to acquire CPU lock";
+          }
+        }
+      }
+    }
   }
-  return random() % get_num_cpus();
+
+  // Didn't work - just use a random CPU
+  cpu_lock_fd_out.close();
+  return cpus[random() % cpus.size()];
 }
 
 uint32_t crc32(uint32_t crc, unsigned char* buf, size_t len) {
@@ -1616,6 +2154,24 @@ void write_all(int fd, const void* buf, size_t size) {
   }
 }
 
+ssize_t pwrite_all_fallible(int fd, const void* buf, size_t size, off64_t offset) {
+  ssize_t written = 0;
+  while (size > 0) {
+    ssize_t ret = ::pwrite64(fd, buf, size, offset);
+    if (ret <= 0) {
+      if (written > 0) {
+        return written;
+      }
+      return ret;
+    }
+    buf = static_cast<const char*>(buf) + ret;
+    written += ret;
+    offset += ret;
+    size -= ret;
+  }
+  return written;
+}
+
 bool is_directory(const char* path) {
   struct stat buf;
   if (stat(path, &buf) < 0) {
@@ -1676,4 +2232,211 @@ size_t word_size(SupportedArch arch) {
   RR_ARCH_FUNCTION(word_size_arch, arch);
 }
 
+string json_escape(const string& str, size_t pos) {
+  string out;
+  for (size_t i = pos; i < str.size(); ++i) {
+    char c = str[i];
+    if (c < 32) {
+      char buf[8];
+      sprintf(buf, "\\u%04x", c);
+      out += buf;
+    } else if (c == '\\') {
+      out += "\\\\";
+    } else if (c == '\"') {
+      out += "\\\"";
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
+void sleep_time(double t) {
+  struct timespec ts;
+  ts.tv_sec = (time_t)floor(t);
+  ts.tv_nsec = (long)((t - ts.tv_sec) * 1e9);
+  nanosleep(&ts, NULL);
+}
+
+static bool is_component(const char* p, const char* component) {
+  while (*component) {
+    if (*p != *component) {
+      return false;
+    }
+    ++p;
+    ++component;
+  }
+  return *p == '/' || !*p;
+}
+
+void normalize_file_name(string& s)
+{
+  size_t s_len = s.size();
+  size_t out = 0;
+  for (size_t i = 0; i < s_len; ++i) {
+    if (s[i] == '/') {
+      if (s.c_str()[i + 1] == '/') {
+        // Skip redundant '/'
+        continue;
+      }
+      if (is_component(s.c_str() + i + 1, ".")) {
+        // Skip redundant '/.'
+        ++i;
+        continue;
+      }
+      if (is_component(s.c_str() + i + 1, "..")) {
+        // Peel off '/..'
+        if (out == 0) {
+          // If there's nothing to peel off, just discard this.
+          i += 2;
+          continue;
+        }
+        size_t p = s.rfind('/', out - 1);
+        if (p != string::npos) {
+          out = p;
+          i += 2;
+          continue;
+        }
+      }
+    }
+    s[out] = s[i];
+    ++out;
+  }
+  s.resize(out);
+}
+
+std::vector<int> read_all_proc_fds(pid_t tid)
+{
+  std::vector<int> ret;
+  char buf[1000];
+  sprintf(buf, "/proc/%d/fd", tid);
+  DIR *fddir = opendir(buf);
+  DEBUG_ASSERT(fddir != nullptr);
+  while (struct dirent *dir = readdir(fddir)) {
+    ret.push_back(atoi(dir->d_name));
+  }
+  closedir(fddir);
+  return ret;
+}
+
+std::string find_exec_stub(SupportedArch arch) {
+  string exe_path = resource_path() + "bin/";
+  if (arch == x86 && NativeArch::arch() == x86_64) {
+    exe_path += "rr_exec_stub_32";
+  } else {
+    exe_path += "rr_exec_stub";
+  }
+  return exe_path;
+}
+
+int pop_count(uint64_t v) {
+  int ret = 0;
+  while (v > 0) {
+    if (v & 1) {
+      ++ret;
+    }
+    v >>= 1;
+  }
+  return ret;
+}
+
+void SAFE_FATAL(int err, const char *msg)
+{
+  static char prefix[] = "FATAL (errno = ";
+  const char *errstr = errno_name_cstr(err);
+  char buf[100];
+  if (errstr == NULL) {
+    snprintf(buf, sizeof(buf), "errno(%d)", err);
+    errstr = buf;
+  }
+  static char bridge[] = "): ";
+  static char nl[] = "\n";
+  struct iovec out[5] = {
+    {.iov_base = prefix, .iov_len=sizeof(prefix)},
+    {.iov_base = (char*)errstr, .iov_len=strlen(errstr)},
+    {.iov_base = bridge, .iov_len=sizeof(errstr)},
+    {.iov_base = (char*)msg, .iov_len=strlen(msg)},
+    {.iov_base = nl, .iov_len=sizeof(nl)}
+  };
+  __attribute__((unused)) ssize_t ret = ::writev(STDERR_FILENO, out, sizeof(out)/sizeof(struct iovec));
+  abort();
+}
+
+static int child_SIGSEGV(__attribute__((unused)) void* arg) {
+  kill(getpid(), SIGSEGV);
+  return 0;
+}
+
+bool coredumping_signal_takes_down_entire_vm() {
+  // The kernel behavior here changed in 5.16. Prior to that,
+  // a coredumping signal would bring down the entire vm.
+  // Starting with 5.16 it only brings down the thread group.
+  // -1 here indicates uninitialized, 0 the new behavior, and
+  // 1 the old behavior.
+  static int coredumping_signal_vm_behavior = -1;
+  if (coredumping_signal_vm_behavior < 0) {
+    pid_t child = -1;
+    int status = -1;
+    LOG(debug) << "Testing coredumping behavior in the presence of CLONE_VM";
+    if ((child = fork()) == 0) {
+      // Remove any handlers and make sure we get the default signal behavior.
+      signal(SIGSEGV, SIG_DFL);
+      // Don't litter the system with core dumps.
+      prctl(PR_SET_DUMPABLE, 0);
+      // Allocate a stack for the child.
+      const size_t stack_size = 1 << 20;
+      void* stack = mmap(NULL, stack_size, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+      pid_t tid = clone(child_SIGSEGV, (void*)((uintptr_t)stack + stack_size),
+                      CLONE_VM, NULL, NULL, NULL, NULL);
+      DEBUG_ASSERT(tid > 0);
+
+      pid_t ret = waitpid(tid, &status, __WALL);
+      DEBUG_ASSERT(ret == tid);
+      DEBUG_ASSERT(WIFSIGNALED(status));
+      exit(0);
+    }
+
+    DEBUG_ASSERT(child > 0);
+    pid_t ret = waitpid(child, &status, __WALL);
+    DEBUG_ASSERT(ret == child);
+    coredumping_signal_vm_behavior = WIFSIGNALED(status);
+  }
+
+  return coredumping_signal_vm_behavior > 0;
+}
+
+int parse_tid_from_proc_path(const std::string& pathname,
+                             const std::string& property) {
+  // XXX When rr becomes c++17 - use string view instead. Has better API for
+  // this stuff.
+  const auto proc_length = 6;
+  const auto prop_should_begin =
+      pathname.size() - property.size() - (pathname.back() == '/');
+  if (pathname.substr(prop_should_begin, property.size()) == property) {
+    const auto task = "task/"s;
+    const auto pos = pathname.find(task);
+    if (pos == std::string::npos) {
+      auto s = pathname.substr(proc_length);
+      if (pathname.back() == '/')
+        s.pop_back();
+      char* end;
+      const int tid = strtol(s.c_str(), &end, 10);
+      if (end == property) {
+        return tid;
+      }
+    } else {
+      auto s = pathname.substr(pos + task.size());
+      if (pathname.back() == '/')
+        s.pop_back();
+      char* end;
+      const int tid = strtol(s.c_str(), &end, 10);
+      if (end == property) {
+        return tid;
+      }
+    }
+  }
+  return -1;
+}
 } // namespace rr

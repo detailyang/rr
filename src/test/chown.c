@@ -28,22 +28,30 @@ static void change_group_at(const char* path, gid_t new_gid) {
 }
 
 int main(void) {
-  gid_t groups[32];
+  long ngroups_max;
+  gid_t *groups;
   int ngroups;
   gid_t this_group, other_group;
   int fd;
 
+  ngroups_max = sysconf(_SC_NGROUPS_MAX);
+  test_assert(ngroups_max != -1);
+  groups = alloca(sizeof(gid_t)*ngroups_max);
+
   this_group = getegid();
   atomic_printf("Current group is %d\n", this_group);
 
-  ngroups = getgroups(ALEN(groups), groups);
+  ngroups = getgroups(ngroups_max, groups);
   test_assert(ngroups > 0);
 
-  other_group = groups[0];
-  if (this_group == other_group && ngroups > 1) {
-    other_group = groups[1];
+  other_group = this_group;
+  for (int i = 0; i < ngroups; i++) {
+    if (groups[i] != this_group && groups[i] != (uint16_t)-2) {
+      other_group = groups[i];
+      break;
+    }
   }
-  if (this_group == other_group) {
+  if (other_group == this_group) {
     atomic_puts("WARNING: unable to properly test chown()");
   }
 
