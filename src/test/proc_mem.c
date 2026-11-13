@@ -54,6 +54,14 @@ static int do_open_task_tid(int child) {
   return open(buf, O_RDWR);
 }
 
+#ifdef SYS_creat
+static int do_creat(int child) {
+  char buf[1024];
+  sprintf(buf, "/proc/%d/mem", child);
+  return syscall(SYS_creat, buf, 0600);
+}
+#endif
+
 static int do_cmsg_generic(int (*opener)(int), int child, int use_recvmmsg) {
   int fd = opener(child);
   /* launder it through SCM_RIGHTS */
@@ -131,15 +139,15 @@ static void do_test(int (*opener)(int)) {
   fd = opener(child);
   test_assert(fd >= 0);
   test_assert(sizeof(COOKIE) ==
-              pwrite(fd, &COOKIE, sizeof(COOKIE), (off_t)&cookie1));
+              pwrite(fd, &COOKIE, sizeof(COOKIE), (uintptr_t)&cookie1));
 
   iov[0].iov_base = (char*)&COOKIE;
   iov[0].iov_len = 2;
   iov[1].iov_base = (char*)&COOKIE + 2;
   iov[1].iov_len = 2;
-  test_assert(sizeof(COOKIE) == pwritev(fd, iov, 2, (off_t)&cookie2));
+  test_assert(sizeof(COOKIE) == pwritev(fd, iov, 2, (uintptr_t)&cookie2));
 
-  lseek(fd, (off_t)&cookie3, SEEK_SET);
+  lseek(fd, (uintptr_t)&cookie3, SEEK_SET);
   test_assert(sizeof(COOKIE) == write(fd, &COOKIE, sizeof(COOKIE)));
 
   test_assert(1 == write(pipe_fds[1], "x", 1));
@@ -150,6 +158,9 @@ static void do_test(int (*opener)(int)) {
 int main(void) {
   do_test(do_open);
   do_test(do_open_task_tid);
+#ifdef SYS_creat
+  do_test(do_creat);
+#endif
   do_test(do_openat);
   do_test(do_openat_task_tid);
   do_test(do_openat_task_tid2);

@@ -114,7 +114,7 @@ static void maybe_noop_restore_syscallbuf_scratch(ReplayTask* t) {
     // Untraced syscalls always have t's arch
     LOG(debug) << "  noop-restoring scratch for write-only desched'd "
                << syscall_name(t->regs().original_syscallno(), t->arch());
-    t->set_data_from_trace();
+    t->apply_data_record_from_trace();
   }
 }
 
@@ -218,7 +218,8 @@ template <typename Arch> static void prepare_clone(ReplayTask* t) {
   Registers entry_regs = r;
 
   // Run; we will be interrupted by PTRACE_EVENT_CLONE/FORK/VFORK.
-  t->resume_execution(RESUME_CONT, RESUME_WAIT, RESUME_NO_TICKS);
+  bool ok = t->resume_execution(RESUME_CONT, RESUME_WAIT_NO_EXIT, RESUME_NO_TICKS);
+  ASSERT(t, ok) << "Tracee was killed";
 
   pid_t new_tid;
   while (!t->clone_syscall_is_complete(&new_tid, Arch::arch())) {
@@ -227,11 +228,12 @@ template <typename Arch> static void prepare_clone(ReplayTask* t) {
     // state to try the syscall again.
     ASSERT(t, t->regs().syscall_result_signed() == -EAGAIN);
     t->set_regs(entry_regs);
-    t->resume_execution(RESUME_CONT, RESUME_WAIT, RESUME_NO_TICKS);
+    bool ok = t->resume_execution(RESUME_CONT, RESUME_WAIT_NO_EXIT, RESUME_NO_TICKS);
+    ASSERT(t, ok) << "Tracee was killed";
   }
 
   // Get out of the syscall
-  t->exit_syscall();
+  t->exit_syscall(Arch::arch());
 
   ASSERT(t, !t->ptrace_event())
       << "Unexpected ptrace event while waiting for syscall exit; got "
@@ -249,7 +251,7 @@ template <typename Arch> static void prepare_clone(ReplayTask* t) {
   t->set_regs(r);
   t->canonicalize_regs(trace_frame.event().Syscall().arch());
 
-  // Dig the recorded tid out out of the trace. The tid value returned in
+  // Dig the recorded tid out of the trace. The tid value returned in
   // the recorded registers could be in a different pid namespace from rr's,
   // so we can't use it directly.
   TraceTaskEvent tte = read_task_trace_event(t, TraceTaskEvent::CLONE);
@@ -269,16 +271,16 @@ template <typename Arch> static void prepare_clone(ReplayTask* t) {
   if (Arch::clone == t->regs().original_syscallno()) {
     /* FIXME: what if registers are non-null and contain an
      * invalid address? */
-    t->set_data_from_trace();
+    t->apply_data_record_from_trace();
 
     if (Arch::clone_tls_type == Arch::UserDescPointer) {
-      t->set_data_from_trace();
-      new_task->set_data_from_trace();
+      t->apply_data_record_from_trace();
+      new_task->apply_data_record_from_trace();
     } else {
       DEBUG_ASSERT(Arch::clone_tls_type == Arch::PthreadStructurePointer);
     }
-    new_task->set_data_from_trace();
-    new_task->set_data_from_trace();
+    new_task->apply_data_record_from_trace();
+    new_task->apply_data_record_from_trace();
   }
 
   // Fix registers in new task
@@ -309,10 +311,13 @@ template <typename Arch> static void prepare_clone(ReplayTask* t) {
   }
 
   TraceReader::MappedData data;
-  KernelMapping km = t->trace_reader().read_mapped_region(&data);
-  init_scratch_memory(new_task, km, data);
-
-  new_task->vm()->after_clone();
+  bool found;
+  KernelMapping km = t->trace_reader().read_mapped_region(&data, &found);
+  // If the new task died before rr could map its scratch memory, the trace
+  // has no scratch mapping for it.
+  if (found) {
+    init_scratch_memory(new_task, km, data);
+  }
 }
 
 static void restore_mapped_region(ReplayTask* t, AutoRemoteSyscalls& remote,
@@ -403,7 +408,7 @@ static void process_execve(ReplayTask* t, const TraceFrame& trace_frame,
       // (up to) two kms that have different fsnames but do each have an
       // executable segment, as well as the km that contains the ip. This is
       // slightly complicated, but should handle the case where either file has
-      // more than one exectuable segment.
+      // more than one executable segment.
       const string& file_name = km.fsname();
       if ((km.prot() & PROT_EXEC) && file_name.size() > 0 &&
           // Make sure to exclude [vdso] (and similar) and executable stacks.
@@ -448,6 +453,11 @@ static void process_execve(ReplayTask* t, const TraceFrame& trace_frame,
                                ? kms[exe_km].fsname()
                                : datas[exe_km].file_name;
   t->post_exec_syscall(exe_name, kms[exe_km].fsname());
+  t->vm()->set_interp_base(tte.interp_base());
+  t->vm()->set_interp_name(tte.interp_name());
+  if (!t->set_pac_keys(tte.pac_data())) {
+    LOG(warn) << "Failed to restore PAC keys. Replay may fail.";
+  }
 
   t->fd_table()->close_after_exec(
       t, t->current_trace_frame().event().Syscall().exec_fds_to_close);
@@ -460,7 +470,7 @@ static void process_execve(ReplayTask* t, const TraceFrame& trace_frame,
 
     // Now fix up the address space. First unmap all the mappings other than
     // our rr page.
-    t->vm()->unmap_all_but_rr_page(remote);
+    t->vm()->unmap_all_but_rr_mappings(remote);
     // We will have unmapped the stack memory that |remote| would have used for
     // memory parameters. Fortunately process_mapped_region below doesn't
     // need any memory parameters for its remote syscalls.
@@ -469,28 +479,24 @@ static void process_execve(ReplayTask* t, const TraceFrame& trace_frame,
     restore_mapped_region(t, remote, kms[0], datas[0]);
   }
 
-  const string& recorded_exe_name = kms[exe_km].fsname();
-
+  // The last mapping is the scratch memory rr mapped after the exec, unless
+  // the task died before rr could map it.
+  bool have_scratch = kms.size() > 1 &&
+      kms.back().start() == AddressSpace::exec_scratch_start();
   {
     // Now that [stack] is mapped, reinitialize AutoRemoteSyscalls with
     // memory parameters enabled.
     AutoRemoteSyscalls remote(t);
 
     // Now map in all the mappings that we recorded from the real exec.
-    for (ssize_t i = 1; i < ssize_t(kms.size()) - 1; ++i) {
+    for (ssize_t i = 1; i < ssize_t(kms.size()) - (have_scratch ? 1 : 0); ++i) {
       restore_mapped_region(t, remote, kms[i], datas[i]);
     }
-
-    size_t index = recorded_exe_name.rfind('/');
-    string name =
-        string("rr:") +
-        recorded_exe_name.substr(index == string::npos ? 0 : index + 1);
-    AutoRestoreMem mem(remote, name.c_str());
-    remote.infallible_syscall(syscall_number_for_prctl(t->arch()), PR_SET_NAME,
-                              mem.get());
   }
 
-  init_scratch_memory(t, kms.back(), datas.back());
+  if (have_scratch) {
+    init_scratch_memory(t, kms.back(), datas.back());
+  }
 
   // Apply final data records --- fixing up the last page in each data segment
   // for zeroing applied by the kernel, and applying monkeypatches.
@@ -509,7 +515,7 @@ static void process_execve(ReplayTask* t, const TraceFrame& trace_frame,
 static void process_brk(ReplayTask* t) {
   TraceReader::MappedData data;
   KernelMapping km = t->trace_reader().read_mapped_region(&data);
-  // Zero flags means it's an an unmap, or no change.
+  // Zero flags means it's an unmap, or no change.
   if (km.flags()) {
     AutoRemoteSyscalls remote(t);
     ASSERT(t, data.source == TraceReader::SOURCE_ZERO);
@@ -559,44 +565,16 @@ static void finish_anonymous_mmap(ReplayTask* t, AutoRemoteSyscalls& remote,
                            device, inode, nullptr, &recorded_km, emu_file);
 }
 
-static void write_mapped_data_with_holes(ReplayTask* t, const TraceReader::RawDataWithHoles& buf) {
-  unique_ptr<AutoRemoteSyscalls> remote;
-  size_t data_offset = 0;
-  size_t addr_offset = 0;
-  auto holes_iter = buf.holes.begin();
-  while (data_offset < buf.data.size() || holes_iter != buf.holes.end()) {
-    if (holes_iter != buf.holes.end() && holes_iter->offset == addr_offset) {
-      t->write_zeroes(&remote, buf.addr + addr_offset, holes_iter->size);
-      addr_offset += holes_iter->size;
-      ++holes_iter;
-      continue;
-    }
-    size_t data_end = buf.data.size();
-    if (holes_iter != buf.holes.end()) {
-      data_end = data_offset + holes_iter->offset - addr_offset;
-    }
-    t->write_bytes_helper(buf.addr + addr_offset, data_end - data_offset, buf.data.data() + data_offset,
-                          nullptr);
-    addr_offset += data_end - data_offset;
-    data_offset = data_end;
-  }
-}
-
 static void write_mapped_data(ReplayTask* t,
                               remote_ptr<void> rec_addr,
                               size_t size,
                               TraceReader::MappedData& data) {
   switch (data.source) {
   case TraceReader::SOURCE_TRACE: {
-    TraceReader::RawDataWithHoles buf;
-    ASSERT(t, t->trace_reader().read_raw_data_for_frame_with_holes(buf));
-    ASSERT(t, buf.addr == rec_addr);
     // Note that this gets called for remaps and shared maps that refer to the same pages
     // as previous maps and so the data we're recording might not be the initial data
     // for those pages, but it is the inital data *for this mapping*.
-    write_mapped_data_with_holes(t, buf);
-    t->vm()->maybe_update_breakpoints(t, rec_addr.cast<uint8_t>(),
-                                      buf.data.size());
+    t->apply_data_record_from_trace();
     break;
   }
   case TraceReader::SOURCE_FILE: {
@@ -631,7 +609,7 @@ static void write_mapped_data(ReplayTask* t,
 
 static void finish_private_mmap(ReplayTask* t, AutoRemoteSyscalls& remote,
                                 remote_ptr<void> rec_addr, size_t length,
-                                int prot, int flags, off64_t offset_bytes,
+                                int prot, int flags, off_t offset_bytes,
                                 const KernelMapping& km,
                                 TraceReader::MappedData& data) {
   LOG(debug) << "  finishing private mmap of " << km.fsname();
@@ -655,7 +633,7 @@ static void finish_private_mmap(ReplayTask* t, AutoRemoteSyscalls& remote,
 static void finish_shared_mmap(ReplayTask* t, AutoRemoteSyscalls& remote,
                                remote_ptr<void> rec_addr, size_t length,
                                int prot, int flags, const vector<TraceRemoteFd>& fds,
-                               off64_t offset_bytes,
+                               off_t offset_bytes,
                                const KernelMapping& km,
                                TraceReader::MappedData& data) {
   // Ensure there's a virtual file for the file that was mapped
@@ -713,7 +691,7 @@ static void finish_shared_mmap(ReplayTask* t, AutoRemoteSyscalls& remote,
 
 static void process_mmap(ReplayTask* t, const TraceFrame& trace_frame,
                          size_t length, int prot, int flags, int fd,
-                         off64_t offset_bytes, ReplayTraceStep* step) {
+                         off_t offset_bytes, ReplayTraceStep* step) {
   step->action = TSTEP_RETIRE;
 
   {
@@ -808,10 +786,13 @@ static void process_mremap(ReplayTask* t, const TraceFrame& trace_frame,
   step->action = TSTEP_RETIRE;
 
   auto& trace_regs = trace_frame.regs();
-  remote_ptr<void> old_addr = trace_frame.regs().orig_arg1();
+  // The kernel ignores the tag of the old address.
+  remote_ptr<void> old_addr =
+      untagged_addr(t->arch(), trace_frame.regs().orig_arg1());
   size_t old_size = ceil_page_size(trace_regs.arg2());
   remote_ptr<void> new_addr = trace_frame.regs().syscall_result();
   size_t new_size = ceil_page_size(trace_regs.arg3());
+  int flags = trace_regs.arg4_signed();
 
   // The recorded mremap call succeeded, so we know the original mapping can be
   // treated as a single mapping.
@@ -843,19 +824,20 @@ static void process_mremap(ReplayTask* t, const TraceFrame& trace_frame,
       // addresses? Hopefully the kernel doesn't do that to us!!!
       remote.infallible_syscall_if_alive(trace_regs.original_syscallno(), old_addr,
                                          old_size, new_size,
-                                         MREMAP_MAYMOVE | MREMAP_FIXED, new_addr);
+                                         flags | MREMAP_MAYMOVE | MREMAP_FIXED, new_addr);
     }
 
     remote.regs().set_syscall_result(new_addr);
   }
 
-  t->vm()->remap(t, old_addr, old_size, new_addr, new_size);
+  t->vm()->remap(t, old_addr, old_size, new_addr, new_size, flags);
 
   AddressSpace::Mapping mapping = t->vm()->mapping_of(new_addr);
   auto f = mapping.emu_file;
   if (f) {
     f->ensure_size(mapping.map.file_offset_bytes() + new_size);
-  } else if (new_size > old_size && mapping.map.fsname().size() > 0) {
+  } else if (new_size > old_size && mapping.map.fsname().size() > 0 &&
+             !mapping.map.is_named_anonymous()) {
     struct stat st;
     int ret = stat(mapping.map.fsname().c_str(), &st);
     if (ret != 0) {
@@ -943,21 +925,56 @@ static void process_shmdt(ReplayTask* t, const TraceFrame& trace_frame,
   t->validate_regs();
 }
 
+// Return true if this madvise() call should be passed through and
+// executed by the tracee.
+static bool process_madvise(ReplayTask* t, const TraceFrame& trace_frame,
+                            int advice, int result) {
+  switch (advice) {
+    case MADV_DONTNEED:
+    case MADV_REMOVE:
+    case MADV_DONTNEED_LOCKED: {
+      const SyscallEvent& ev = trace_frame.event().Syscall();
+      if (result == 0) {
+        ASSERT(t, ev.madvise_ranges.empty());
+        return true;
+      }
+      if (!ev.madvise_ranges.empty()) {
+        AutoRemoteSyscalls remote(t);
+        for (const auto& r : ev.madvise_ranges) {
+          remote.infallible_syscall(syscall_number_for_madvise(t->arch()),
+              r.start(), r.size(), advice);
+        }
+      }
+      return false;
+    }
+    /* These are not technically required to be passed through, but the
+       syscallbuf code does, so if we don't here, we risk fracturing
+       otherwise coalescable memory regions. Asan in particular triggers
+       a pathological case here that quickly exhausts the total mapping
+       limit by fracturing its shadow region */
+    case MADV_NORMAL:
+    case MADV_RANDOM:
+    case MADV_SEQUENTIAL:
+    case MADV_WILLNEED:
+    case MADV_MERGEABLE:
+    case MADV_UNMERGEABLE:
+    case MADV_HUGEPAGE:
+    case MADV_NOHUGEPAGE:
+    case MADV_DONTDUMP:
+    case MADV_DODUMP:
+      return true;
+    default:
+      return false;
+  }
+}
+
 static void process_init_buffers(ReplayTask* t, ReplayTraceStep* step) {
   step->action = TSTEP_RETIRE;
-
-  /* Proceed to syscall exit so we can run our own syscalls. */
-  remote_ptr<void> rec_child_map_addr =
-      t->current_trace_frame().regs().syscall_result();
 
   /* We don't want the desched event fd during replay, because
    * we already know where they were.  (The perf_event fd is
    * emulated anyway.) */
-  t->init_buffers(rec_child_map_addr);
-
-  ASSERT(t, t->syscallbuf_child.cast<void>() == rec_child_map_addr)
-      << "Should have mapped syscallbuf at " << rec_child_map_addr
-      << ", but it's at " << t->syscallbuf_child;
+  t->init_buffers();
   t->validate_regs();
 }
 
@@ -1138,6 +1155,7 @@ static void rep_process_syscall_arch(ReplayTask* t, ReplayTraceStep* step,
       case Arch::pkey_mprotect:
       case Arch::sigreturn:
       case Arch::rt_sigreturn:
+      case Arch::prctl:
         break;
       default:
         return;
@@ -1145,7 +1163,7 @@ static void rep_process_syscall_arch(ReplayTask* t, ReplayTraceStep* step,
   }
 
   /* Manual implementations of irregular syscalls that need to do more during
-   * replay than just modify register and memory state.
+   * replay than just modify registenter_syscaller and memory state.
    * Don't let a negative incoming syscall number be treated as a real
    * system call that we assigned a negative number because it doesn't
    * exist in this architecture.
@@ -1194,12 +1212,9 @@ static void rep_process_syscall_arch(ReplayTask* t, ReplayTraceStep* step,
       return process_mremap(t, trace_frame, step);
 
     case Arch::madvise:
-      switch ((int)t->regs().arg3()) {
-        case MADV_DONTNEED:
-        case MADV_REMOVE:
-          break;
-        default:
-          return;
+      if (!process_madvise(t, trace_frame, trace_regs.arg3(),
+                           trace_regs.syscall_result_signed())) {
+        return;
       }
       RR_FALLTHROUGH;
     case Arch::arch_prctl: {
@@ -1212,11 +1227,16 @@ static void rep_process_syscall_arch(ReplayTask* t, ReplayTraceStep* step,
       RR_FALLTHROUGH;
     case Arch::prctl: {
       auto arg1 = t->regs().arg1();
-      if (sys == Arch::prctl && (Arch::arch() != aarch64 ||
-          arg1 != PR_SET_SPECULATION_CTRL)) {
+      if (sys == Arch::prctl &&
+          (Arch::arch() != aarch64 || (arg1 != PR_SET_SPECULATION_CTRL &&
+                                       arg1 != PR_SVE_SET_VL)) &&
+          ((unsigned long)t->regs().arg1() != PR_SET_VMA || trace_regs.syscall_result_signed() == -EINVAL)) {
         // On aarch64 PR_SET_SPECULATION_CTRL affects the pstate
-        // register during the system call, so we need to replay
-        // it, otherwise we'll get a mismatch there.
+        // register during the system call, and PR_SVE_SET_VL affects
+        // the SVE vector length, so we need to replay them, otherwise
+        // we'll get a mismatch.
+        // We want to replay PR_SET_VMA as well, but not if it originally failed
+        // with EINVAL because the recording kernel may not have supported it.
         return;
       }
     }
@@ -1235,8 +1255,8 @@ static void rep_process_syscall_arch(ReplayTask* t, ReplayTraceStep* step,
       if (modified_sys == Arch::mprotect) {
         t->vm()->fixup_mprotect_growsdown_parameters(t);
       }
-      t->enter_syscall();
-      t->exit_syscall();
+      t->enter_syscall(Arch::arch());
+      t->exit_syscall(Arch::arch());
       ASSERT(t, t->regs().syscall_result() == trace_regs.syscall_result());
       if (modified_sys == Arch::mprotect) {
         Registers r2 = t->regs();
@@ -1270,14 +1290,14 @@ static void rep_process_syscall_arch(ReplayTask* t, ReplayTraceStep* step,
         t->move_to_signal_stop();
       }
       t->set_regs(trace_regs);
-      t->set_extra_regs(trace_frame.extra_regs());
+      t->set_recorded_extra_regs(trace_frame.extra_regs());
       step->action = TSTEP_RETIRE;
       return;
 
     case Arch::pkey_alloc:
       // Older versions of rr (incorrectly) did not record the extra regs here.
       if (t->session().has_trace_quirk(TraceReader::PkeyAllocRecordedExtraRegs)) {
-        t->set_extra_regs(trace_frame.extra_regs());
+        t->set_recorded_extra_regs(trace_frame.extra_regs());
       }
       return;
 
@@ -1328,8 +1348,14 @@ static void rep_process_syscall_arch(ReplayTask* t, ReplayTraceStep* step,
     case Arch::openat:
       handle_opened_files(t, t->regs().arg3());
       break;
+    case Arch::openat2:
+      handle_opened_files(t, t->read_mem(remote_ptr<int64_t>(t->regs().arg3())));
+      break;
     case Arch::open:
       handle_opened_files(t, t->regs().arg2());
+      break;
+    case Arch::creat:
+      handle_opened_files(t, O_CREAT | O_WRONLY | O_TRUNC);
       break;
 
     case Arch::write:
@@ -1346,7 +1372,7 @@ static void rep_process_syscall_arch(ReplayTask* t, ReplayTraceStep* step,
       if (dest) {
         uint32_t iov_cnt = t->regs().arg5();
         for (uint32_t i = 0; i < iov_cnt; ++i) {
-          dest->set_data_from_trace();
+          dest->apply_data_record_from_trace();
         }
       }
       return;

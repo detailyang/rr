@@ -31,7 +31,7 @@
     xor %eax, %eax; \
     ret
 #define TRAP \
-    int $3; \
+    nop; int $3; \
     ret
 #define PAGE_ALIGN \
     .align 0x1000
@@ -68,9 +68,6 @@
 PAGE_ALIGN
 .fill PRELOAD_LIBRARY_PAGE_SIZE, 1, 0xff
 
-.section .vdso.text, "a", @progbits
-PAGE_ALIGN
-
 #include "rr_vdso.S"
 
 .section .record.text, "a", @progbits
@@ -79,6 +76,7 @@ PAGE_ALIGN
 .global rr_page_start
 rr_page_start:
 
+#define LABEL(name) #name:;
 #define STARTPROC(name) #name:; .cfi_startproc
 #define STARTPROC_GLOBAL(name) .global #name; #name:; .cfi_startproc
 #define CFI_ENDPROC .cfi_endproc
@@ -89,8 +87,10 @@ PAGE_ALIGN
 replay_page:
 // No CFI instructions or symbols for the replay page - we'll implicitly share
 // those of the record copy
+#undef LABEL
 #undef STARTPROC
 #undef CFI_ENDPROC
+#define LABEL(name)
 #define STARTPROC(name)
 #define CFI_ENDPROC
 #define IS_REPLAY 1

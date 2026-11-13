@@ -31,8 +31,8 @@ static void handle_usr1(__attribute__((unused)) int sig) {
 }
 
 static void *do_thread(void* futex_addr) {
-  atomic_printf("Thread tid is %d\n", gettid());
-  pid_t thread_tid = gettid();
+  atomic_printf("Thread tid is %d\n", sys_gettid());
+  pid_t thread_tid = sys_gettid();
   int ret = write(pid_pipe[1], &thread_tid, sizeof(pid_t));
   test_assert(ret == sizeof(pid_t));
   futex(futex_addr, FUTEX_WAIT, 0, NULL, NULL, 0);
@@ -91,7 +91,7 @@ int main(int argc, char *argv[]) {
   siginfo_t info;
   sigset_t set;
   sigemptyset(&set);
-  // Block all relevant singals on the main thread to make sure that
+  // Block all relevant signals on the main thread to make sure that
   // the thread gets selected to receive the signal (Condition 1).
   // Corner case: Because we do waitpid below, the kernel internally removes
   // SIGCHLD from the blocked list for this thread and does not wake up

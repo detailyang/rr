@@ -13,6 +13,7 @@
 
 #include "log.h"
 #include "main.h"
+#include "WaitManager.h"
 
 using namespace std;
 
@@ -54,7 +55,7 @@ bool parse_export_checkpoints(const string& arg, FrameTime& export_checkpoints_e
 ScopedFd bind_export_checkpoints_socket(int count, const string& socket_file_name) {
   unlink(socket_file_name.c_str());
 
-  ScopedFd sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  ScopedFd sock = ScopedFd(socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0));
   if (!sock.is_open()) {
     FATAL() << "Can't create Unix socket " << socket_file_name;
   }
@@ -105,7 +106,7 @@ static void recv_all(ScopedFd& sock, void* vbuf, size_t count) {
 }
 
 static void setup_child_fds(vector<int> fds, CommandForCheckpoint& command_for_checkpoint) {
-  command_for_checkpoint.exit_notification_fd = fds[0];
+  command_for_checkpoint.exit_notification_fd = ScopedFd(fds[0]);
   for (int our_fd = 0; our_fd < 3; ++our_fd) {
     // We deliberately don't set CLOEXEC here since we might want these
     // to be inherited.
@@ -153,7 +154,7 @@ CommandForCheckpoint export_checkpoints(ReplaySession::shr_ptr session, int coun
 
   vector<pid_t> children;
   for (int i = 0; i < count; ++i) {
-    ScopedFd client = accept4(sock, nullptr, nullptr, SOCK_CLOEXEC);
+    ScopedFd client = ScopedFd(accept4(sock, nullptr, nullptr, SOCK_CLOEXEC));
     if (!client.is_open()) {
       FATAL() << "Failed to accept client connection";
     }
@@ -233,16 +234,16 @@ CommandForCheckpoint export_checkpoints(ReplaySession::shr_ptr session, int coun
     if (!child) {
       set_title(args);
       session->forget_tasks();
-      command_for_checkpoint.args = move(args);
-      command_for_checkpoint.session = move(checkpoint);
+      command_for_checkpoint.args = std::move(args);
+      command_for_checkpoint.session = std::move(checkpoint);
       setup_child_fds(fds_data, command_for_checkpoint);
       char ch;
       ret = read(parent_to_child_read, &ch, 1);
       if (ret != 1) {
         FATAL() << "Failed to read parent notification";
       }
-      command_for_checkpoint.session->reattach_tasks(move(new_tracee_socket),
-        move(new_tracee_socket_receiver));
+      command_for_checkpoint.session->reattach_tasks(std::move(new_tracee_socket),
+        std::move(new_tracee_socket_receiver));
       return command_for_checkpoint;
     }
     children.push_back(child);
@@ -259,9 +260,8 @@ CommandForCheckpoint export_checkpoints(ReplaySession::shr_ptr session, int coun
 
   // Wait for and reap all children
   for (size_t i = 0; i < children.size(); ++i) {
-    int status;
-    int ret = waitpid(children[i], &status, 0);
-    if (ret < 0) {
+    WaitResult result = WaitManager::wait_exit(WaitOptions(children[i]));
+    if (result.code != WAIT_OK) {
       FATAL() << "Failed to wait for child " << children[i];
     }
   }
@@ -278,7 +278,7 @@ void notify_normal_exit(ScopedFd& exit_notification_fd) {
 
 int invoke_checkpoint_command(const string& socket_file_name,
     vector<string> args, vector<ScopedFd> fds) {
-  ScopedFd sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  ScopedFd sock = ScopedFd(socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0));
   if (!sock.is_open()) {
     FATAL() << "Can't create Unix socket " << socket_file_name;
   }

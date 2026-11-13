@@ -4,6 +4,7 @@
 #define RR_REPLAY_SESSION_H_
 
 #include <memory>
+#include <ostream>
 #include <set>
 
 #include "AddressSpace.h"
@@ -65,8 +66,8 @@ enum ReplayTraceStepType {
   /* Replay until we exit the next syscall, then patch it. */
   TSTEP_PATCH_AFTER_SYSCALL,
 
-  /* Replay until we hit the ip recorded in the event, then patch the vsyscall caller. */
-  TSTEP_PATCH_VSYSCALL,
+  /* Replay until we hit the ip recorded in the event, then patch the site. */
+  TSTEP_PATCH_IP,
 
   /* Exit the task */
   TSTEP_EXIT_TASK,
@@ -106,12 +107,15 @@ enum ReplayStatus {
   // Some execution was replayed. replay_step() can be called again.
   REPLAY_CONTINUE,
   // All tracees are dead. replay_step() should not be called again.
-  REPLAY_EXITED
+  REPLAY_EXITED,
+  // Replay failed and this session is dead, but trying again with a
+  // new session might work.
+  REPLAY_TRANSIENT_ERROR,
 };
 
 struct ReplayResult {
   ReplayResult(ReplayStatus status = REPLAY_CONTINUE)
-      : status(status), did_fast_forward(false) {}
+      : status(status), did_fast_forward(false), incomplete_fast_forward(false) {}
   ReplayStatus status;
   BreakStatus break_status;
   // True if we did a fast-forward operation, in which case
@@ -154,14 +158,14 @@ private:
 };
 
 /** Encapsulates additional session state related to replay. */
-class ReplaySession : public Session {
+class ReplaySession final : public Session {
 public:
   typedef std::shared_ptr<ReplaySession> shr_ptr;
 
   ~ReplaySession();
 
   virtual Task* new_task(pid_t tid, pid_t rec_tid, uint32_t serial,
-                         SupportedArch a) override;
+                         SupportedArch a, const std::string& name) override;
 
   using Session::clone;
   /**
@@ -241,13 +245,17 @@ public:
       : redirect_stdio(false)
       , share_private_mappings(false)
       , replay_stops_at_first_execve(false)
-      , cpu_unbound(false) {}
+      , cpu_unbound(false)
+      , transient_errors_fatal(false)
+      , intel_pt_start_checking_event(-1) {}
     Flags(const Flags&) = default;
     bool redirect_stdio;
     std::string redirect_stdio_file;
     bool share_private_mappings;
     bool replay_stops_at_first_execve;
     bool cpu_unbound;
+    bool transient_errors_fatal;
+    FrameTime intel_pt_start_checking_event;
   };
 
   /**
@@ -258,9 +266,8 @@ public:
 
   struct StepConstraints {
     explicit StepConstraints(RunCommand command)
-        : command(command), stop_at_time(0), ticks_target(0) {}
+        : command(command), ticks_target(0) {}
     RunCommand command;
-    FrameTime stop_at_time;
     Ticks ticks_target;
     // When the RunCommand is RUN_SINGLESTEP_FAST_FORWARD, stop if the next
     // singlestep would enter one of the register states in this list.
@@ -275,16 +282,11 @@ public:
   };
   /**
    * Take a single replay step.
-   * Ensure we stop at event stop_at_time. If this is not specified,
-   * optimizations may cause a replay_step to pass straight through
-   * stop_at_time.
    * Outside of replay_step, no internal breakpoints will be set for any
    * task in this session.
-   * Stop when the current event reaches stop_at_time (i.e. this event has
-   * is the next event to be replayed).
    * If ticks_target is nonzero, stop before the current task's ticks
-   * reaches ticks_target (but not too far before, unless we hit a breakpoint
-   * or stop_at_time). Only useful for RUN_CONTINUE.
+   * reaches ticks_target (but not too far before, unless we hit a breakpoint).
+   * Only useful for RUN_CONTINUE.
    * Always stops on a switch to a new task.
    */
   ReplayResult replay_step(const StepConstraints& constraints);
@@ -293,6 +295,7 @@ public:
   }
 
   virtual ReplaySession* as_replay() override { return this; }
+  virtual bool need_performance_counters() const override { return !replay_stops_at_first_execve_; }
 
   SupportedArch arch() { return trace_in.arch(); }
 
@@ -310,17 +313,29 @@ public:
   const Flags& flags() const { return flags_; }
 
   typedef std::set<MemoryRange, MappingComparator> MemoryRanges;
+  enum PerfTradeoff {
+    FAST,
+    ACCURATE,
+  };
   /**
    * Returns an ordered set of MemoryRanges representing the address space
    * that is never allocated by any process in the whole lifetime of the trace.
+   * When `perf_tradeoff` is `FAST`, we try to quickly return whatever we can.
+   * When it's `ACCURATE`, we do a much slower pass that can identify more memory.
+   * `ACCURATE` will always identify a superset of the memory identified by
+   * `FAST`.
+   * This memoizes its results so it's fast to call many times.
    */
-  static MemoryRanges always_free_address_space(const TraceReader& reader);
+  const MemoryRanges& always_free_address_space(
+    PerfTradeoff perf_tradeoff = ACCURATE);
+  static void delete_range(ReplaySession::MemoryRanges& ranges,
+                           const MemoryRange& r);
 
   double get_trace_start_time();
 
   virtual TraceStream* trace_stream() override { return &trace_in; }
 
-  virtual int cpu_binding(TraceStream& trace) const override;
+  virtual BindCPU cpu_binding() const override;
 
   bool has_trace_quirk(TraceReader::TraceQuirks quirk) { return trace_in.quirks() & quirk; }
 
@@ -355,14 +370,22 @@ public:
    */
   void reattach_tasks(ScopedFd new_tracee_socket, ScopedFd new_tracee_socket_receiver);
 
+  void notify_detected_transient_error() { detected_transient_error_ = true; }
+
+  void set_suppress_stdio_before_event(FrameTime event) { suppress_stdio_before_event_ = event; }
+  bool mark_stdio() const override;
+  bool echo_stdio() const;
+
 private:
   ReplaySession(const std::string& dir, const Flags& flags);
   ReplaySession(const ReplaySession& other);
 
+  void check_virtual_address_size() const;
+
   ReplayTask* revive_task_for_exec();
   ReplayTask* setup_replay_one_trace_frame(ReplayTask* t);
   void advance_to_next_trace_frame();
-  Completion emulate_signal_delivery(ReplayTask* oldtask, int sig);
+  Completion emulate_signal_delivery(ReplayTask* oldtask);
   Completion try_one_trace_step(ReplayTask* t,
                                 const StepConstraints& step_constraints);
   Completion cont_syscall_boundary(ReplayTask* t,
@@ -391,7 +414,8 @@ private:
   Completion patch_next_syscall(ReplayTask* t,
                                 const StepConstraints& constraints,
                                 bool before_syscall);
-  Completion patch_vsyscall(ReplayTask* t, const StepConstraints& constraints);
+  Completion patch_ip(ReplayTask* t, const StepConstraints& constraints);
+  void apply_patch_data(ReplayTask* t);
   void check_approaching_ticks_target(ReplayTask* t,
                                       const StepConstraints& constraints,
                                       BreakStatus& break_status);
@@ -408,16 +432,26 @@ private:
   siginfo_t last_siginfo_;
   Flags flags_;
   FastForwardStatus fast_forward_status;
+  TaskUid last_task_tuid;
   bool skip_next_execution_event;
+  bool replay_stops_at_first_execve_;
+  bool detected_transient_error_;
 
   // The clock_gettime(CLOCK_MONOTONIC) timestamp of the first trace event, used
   // during 'replay' to calculate the elapsed time between the first event and
   // all other recorded events in the timeline during the 'record' phase.
   double trace_start_time;
 
+  FrameTime suppress_stdio_before_event_;
+
   std::shared_ptr<AddressSpace> syscall_bp_vm;
   remote_code_ptr syscall_bp_addr;
+
+  std::shared_ptr<MemoryRanges> always_free_address_space_fast;
+  std::shared_ptr<MemoryRanges> always_free_address_space_accurate;
 };
+
+void emergency_check_intel_pt(ReplayTask* t, std::ostream& stream);
 
 } // namespace rr
 

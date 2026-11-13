@@ -33,7 +33,9 @@
 #include <linux/videodev2.h>
 #include <linux/vt.h>
 #include <linux/wireless.h>
+#include <mtd/mtd-user.h>
 #include <poll.h>
+#include <sched.h>
 #include <scsi/sg.h>
 #include <signal.h>
 #include <sound/asound.h>
@@ -152,10 +154,20 @@ bool get_syscall_instruction_arch(Task* t, remote_code_ptr ptr,
     }
   }
 
-  bool read_ok = true;
-  vector<uint8_t> code = t->read_mem(ptr.to_data_ptr<uint8_t>(),
-    syscall_instruction_length(t->arch()), &read_ok);
-  if (!read_ok) {
+  if (!t->session().done_initial_exec()) {
+    // We're in rr, and all our syscalls are native.
+    *arch = NativeArch::arch();
+    return true;
+  }
+
+  if (!t->vm()->has_mapping(ptr.to_data_ptr<void>())) {
+    return false;
+  }
+
+  vector<uint8_t> code;
+  code.resize(syscall_instruction_length(t->arch()));
+  ssize_t bytes = t->read_bytes_fallible(ptr.to_data_ptr<void>(), code.size(), code.data());
+  if (bytes != (ssize_t)code.size()) {
     if (ok) {
       *ok = false;
     }
@@ -289,6 +301,7 @@ static void set_arch_siginfo_arch(const siginfo_t& src, void* dest,
   u.linux_api = src;
   auto& siginfo = u.native_api;
 
+  memset(si, 0, sizeof(*si));
   si->si_signo = siginfo.si_signo;
   si->si_errno = siginfo.si_errno;
   si->si_code = siginfo.si_code;
@@ -327,11 +340,26 @@ static void set_arch_siginfo_arch(const siginfo_t& src, void* dest,
         case SIGBUS:
         case SIGFPE:
         case SIGSEGV:
-        case SIGTRAP:
           si->_sifields._sigfault.si_addr_ =
               siginfo._sifields._sigfault.si_addr_.rptr();
           si->_sifields._sigfault.si_addr_lsb_ =
               siginfo._sifields._sigfault.si_addr_lsb_;
+          break;
+        case SIGTRAP:
+          // ptrace stops can have si_signo == SIGTRAP and si_code == SIGTRAP (| 0x80)
+          // in which case pid/uid are set instead of addr/lsb.
+          // SIGTRAP == TRAP_UNK and most architectures don't generate TRAP_UNK at all,
+          // so we should be OK here.
+          if (siginfo.si_code == SIGTRAP ||
+              siginfo.si_code == (SIGTRAP | 0x80)) {
+            si->_sifields._kill.si_pid_ = siginfo._sifields._kill.si_pid_;
+            si->_sifields._kill.si_uid_ = siginfo._sifields._kill.si_uid_;
+          } else {
+            si->_sifields._sigfault.si_addr_ =
+                siginfo._sifields._sigfault.si_addr_.rptr();
+            si->_sifields._sigfault.si_addr_lsb_ =
+                siginfo._sifields._sigfault.si_addr_lsb_;
+          }
           break;
         case SIGIO:
           si->_sifields._sigpoll.si_band_ = siginfo._sifields._sigpoll.si_band_;
@@ -375,4 +403,21 @@ template <typename Arch> static size_t user_fpregs_struct_size_arch() {
 size_t user_fpregs_struct_size(SupportedArch arch) {
   RR_ARCH_FUNCTION(user_fpregs_struct_size_arch, arch)
 }
+
+template <typename Arch> static uint8_t virtual_address_size_arch(remote_ptr<void> ptr) {
+  return sizeof(typename Arch::unsigned_word) * 8 - Arch::clz_ptr(ptr);
+}
+
+uint8_t virtual_address_size(SupportedArch arch, remote_ptr<void> ptr) {
+  RR_ARCH_FUNCTION(virtual_address_size_arch, arch, ptr)
+}
+
+template <typename Arch> static uint8_t default_virtual_address_size_arch() {
+  return Arch::default_virtual_address_size;
+}
+
+uint8_t default_virtual_address_size(SupportedArch arch) {
+  RR_ARCH_FUNCTION(default_virtual_address_size_arch, arch)
+}
+
 }

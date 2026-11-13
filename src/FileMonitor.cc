@@ -19,16 +19,22 @@ using namespace std;
 template <typename Arch>
 static bool is_implicit_offset_syscall_arch(int syscallno) {
   return syscallno == Arch::writev || syscallno == Arch::write ||
-         syscallno == Arch::readv || syscallno == Arch::read;
+         syscallno == Arch::readv || syscallno == Arch::read ||
+         // sendfile() writes at the output fd's offset. splice() can also
+         // take the offset from memory, which replay restores only after
+         // notifying monitors, so the trace keeps it too.
+         syscallno == Arch::sendfile || syscallno == Arch::sendfile64 ||
+         syscallno == Arch::splice;
 }
 
 template <typename Arch>
 static bool is_write_syscall_arch(int syscallno) {
   return syscallno == Arch::writev || syscallno == Arch::write ||
-         syscallno == Arch::pwrite64 || syscallno == Arch::pwritev;
+         syscallno == Arch::pwrite64 || syscallno == Arch::pwritev ||
+         syscallno == Arch::pwritev2;
 }
 
-static bool is_implict_offset_syscall(SupportedArch arch, int syscallno) {
+static bool is_implicit_offset_syscall(SupportedArch arch, int syscallno) {
   RR_ARCH_FUNCTION(is_implicit_offset_syscall_arch, arch, syscallno);
 }
 
@@ -38,8 +44,10 @@ static int64_t retrieve_offset_arch(Task* t, int syscallno,
   switch (syscallno) {
     case Arch::pwrite64:
     case Arch::pwritev:
+    case Arch::pwritev2:
     case Arch::pread64:
-    case Arch::preadv: {
+    case Arch::preadv:
+    case Arch::preadv2: {
       if (sizeof(typename Arch::unsigned_word) == 4) {
         return regs.arg4() | (uint64_t(regs.arg5_signed()) << 32);
       }
@@ -59,6 +67,22 @@ static int64_t retrieve_offset_arch(Task* t, int syscallno,
         offset - regs.syscall_result() :
         offset;
     }
+    case Arch::sendfile:
+    case Arch::sendfile64:
+    case Arch::splice: {
+      ASSERT(t, t->session().is_recording())
+          << "Can only read a file descriptor's offset while recording";
+      // The offset of the output after the write, less the bytes written.
+      remote_ptr<int64_t> off_out;
+      int fd = regs.orig_arg1_signed();
+      if (syscallno == Arch::splice) {
+        off_out = remote_ptr<int64_t>(regs.arg4());
+        fd = regs.arg3_signed();
+      }
+      int64_t offset = off_out.is_null() ? t->fd_offset(fd)
+                                         : t->read_mem(off_out);
+      return offset - regs.syscall_result();
+    }
     default: {
       ASSERT(t, false) << "Can not retrieve offset for this system call.";
       return -1;
@@ -72,7 +96,7 @@ static int64_t retrieve_offset(Task* t, int syscallno, const Registers& regs) {
 
 int64_t FileMonitor::LazyOffset::retrieve(bool needed_for_replay) {
   bool is_replay = t->session().is_replaying();
-  bool is_implicit_offset = is_implict_offset_syscall(t->arch(), syscallno);
+  bool is_implicit_offset = is_implicit_offset_syscall(t->arch(), syscallno);
   ASSERT(t, needed_for_replay || !is_replay);
   // There is no way we can figure out this information now, so retrieve it
   // from the trace (we record it below under the same circumstance).
@@ -107,6 +131,7 @@ std::string file_monitor_type_name(FileMonitor::Type t) {
     CASE(RRPage);
     CASE(ODirect);
     CASE(BpfMap);
+    CASE(PidFd);
     default:
       FATAL() << "Unknown type " << (int)t;
       return "";

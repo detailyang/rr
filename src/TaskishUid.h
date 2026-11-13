@@ -61,6 +61,9 @@ public:
     return TaskishUid<AddressSpace>::operator==(other) &&
            exec_count_ == other.exec_count_;
   }
+  bool operator!=(const AddressSpaceUid& other) const {
+    return !(*this == other);
+  }
   bool operator<(const AddressSpaceUid& other) const {
     if (TaskishUid<AddressSpace>::operator<(other)) {
       return true;
@@ -77,5 +80,13 @@ private:
 };
 
 } // namespace rr
+
+namespace std {
+  template <typename T> struct hash<rr::TaskishUid<T>> {
+    std::size_t operator()(const rr::TaskishUid<T>& k) const {
+      return k.serial();
+    }
+  };
+}
 
 #endif // RR_TASKISH_UID_H_

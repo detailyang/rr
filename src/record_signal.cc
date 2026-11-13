@@ -13,10 +13,6 @@
 #include <sys/user.h>
 #include <syscall.h>
 
-#if defined(__i386__) || defined(__x86_64__)
-#include <x86intrin.h>
-#endif
-
 #include "preload/preload_interface.h"
 
 #include "AutoRemoteSyscalls.h"
@@ -34,15 +30,6 @@
 using namespace std;
 
 namespace rr {
-
-static __inline__ unsigned long long rdtsc(void) {
-#if defined(__i386__) || defined(__x86_64__)
-  return __rdtsc();
-#else
-  FATAL() << "Reached x86-only code path on non-x86 architecture";
-  return 0;
-#endif
-}
 
 static void restore_sighandler_if_not_default(RecordTask* t, int sig) {
   if (t->sig_disposition(sig) != SIGNAL_DEFAULT) {
@@ -91,15 +78,22 @@ static void restore_signal_state(RecordTask* t, int sig,
 static bool try_handle_trapped_instruction(RecordTask* t, siginfo_t* si) {
   ASSERT(t, si->si_signo == SIGSEGV);
 
-  auto trapped_instruction = trapped_instruction_at(t, t->ip());
-  switch (trapped_instruction) {
-    case TrappedInstruction::RDTSC:
-    case TrappedInstruction::RDTSCP:
+  auto special_instruction = special_instruction_at(t, t->ip());
+  switch (special_instruction.opcode) {
+    case SpecialInstOpcode::ARM_MRS_CNTFRQ_EL0:
+    case SpecialInstOpcode::ARM_MRS_CNTVCT_EL0:
+    case SpecialInstOpcode::ARM_MRS_CNTVCTSS_EL0:
+    case SpecialInstOpcode::X86_RDTSC:
+    case SpecialInstOpcode::X86_RDTSCP:
+    case SpecialInstOpcode::X86_TPAUSE:
+    case SpecialInstOpcode::X86_TPAUSE_REX:
+    case SpecialInstOpcode::X86_UMWAIT:
+    case SpecialInstOpcode::X86_UMWAIT_REX:
       if (t->tsc_mode == PR_TSC_SIGSEGV) {
         return false;
       }
       break;
-    case TrappedInstruction::CPUID:
+    case SpecialInstOpcode::X86_CPUID:
       if (t->cpuid_mode == 0) {
         return false;
       }
@@ -108,17 +102,36 @@ static bool try_handle_trapped_instruction(RecordTask* t, siginfo_t* si) {
       return false;
   }
 
-  size_t len = trapped_instruction_len(trapped_instruction);
+  size_t len = special_instruction_len(special_instruction.opcode);
   ASSERT(t, len > 0);
 
   Registers r = t->regs();
-  if (trapped_instruction == TrappedInstruction::RDTSC ||
-      trapped_instruction == TrappedInstruction::RDTSCP) {
+  bool should_retry_patch = false;
+  if (special_instruction.opcode == SpecialInstOpcode::ARM_MRS_CNTVCT_EL0 ||
+      special_instruction.opcode == SpecialInstOpcode::ARM_MRS_CNTVCTSS_EL0) {
+    if (special_instruction.regno != 31) {
+      r.set_x(special_instruction.regno, cntvct());
+    }
+  } else if (special_instruction.opcode == SpecialInstOpcode::ARM_MRS_CNTFRQ_EL0) {
+    if (special_instruction.regno != 31) {
+      r.set_x(special_instruction.regno, cntfrq());
+    }
+  } else if (special_instruction.opcode == SpecialInstOpcode::X86_RDTSC ||
+             special_instruction.opcode == SpecialInstOpcode::X86_RDTSCP) {
+    if (special_instruction.opcode == SpecialInstOpcode::X86_RDTSC &&
+        t->vm()->monkeypatcher().try_patch_trapping_instruction(t, len, true, should_retry_patch)) {
+      Event ev = Event::patch_syscall();
+      ev.PatchSyscall().patch_trapping_instruction = true;
+      t->record_event(ev);
+      t->push_event(Event::noop());
+      return true;
+    }
+
     unsigned long long current_time = rdtsc();
     r.set_rdtsc_output(current_time);
 
     LOG(debug) << " trapped for rdtsc: returning " << current_time;
-  } else if (trapped_instruction == TrappedInstruction::CPUID) {
+  } else if (special_instruction.opcode == SpecialInstOpcode::X86_CPUID) {
     auto eax = r.syscallno();
     auto ecx = r.cx();
     auto cpuid_data = cpuid(eax, ecx);
@@ -127,12 +140,55 @@ static bool try_handle_trapped_instruction(RecordTask* t, siginfo_t* si) {
     r.set_cpuid_output(cpuid_data.eax, cpuid_data.ebx, cpuid_data.ecx,
                        cpuid_data.edx);
     LOG(debug) << " trapped for cpuid: " << HEX(eax) << ":" << HEX(ecx);
+  } else if (special_instruction.opcode == SpecialInstOpcode::X86_TPAUSE ||
+             special_instruction.opcode == SpecialInstOpcode::X86_TPAUSE_REX ||
+             special_instruction.opcode == SpecialInstOpcode::X86_UMWAIT ||
+             special_instruction.opcode == SpecialInstOpcode::X86_UMWAIT_REX) {
+    // The Intel SDM states:
+    //
+    // > Prior to executing the TPAUSE instruction, an operating system may
+    // > specify the maximum delay it allows the processor to suspend its
+    // > operation. It can do so by writing TSC-quanta value to the following
+    // > 32-bit MSR (IA32_UMWAIT_CONTROL at MSR index E1H):
+    // >
+    // > - IA32_UMWAIT_CONTROL[31:2] — Determines the maximum time in TSC-quanta
+    // >   that the processor can reside in either C0.1 or C0.2. A zero value
+    // >   indicates no maximum time. The maximum time value is a 32-bit value
+    // >   where the upper 30 bits come from this field and the lower two bits are zero.
+    // > - IA32_UMWAIT_CONTROL[1] — Reserved.
+    // > - IA32_UMWAIT_CONTROL[0] — C0.2 is not allowed by the OS. Value of “1”
+    // >   means all C0.2 requests revert to C0.1.
+    // >
+    // > If the processor that executed a TPAUSE/UMWAIT instruction wakes due to
+    // > the expiration of the operating system time-limit, the instructions sets
+    // > RFLAGS.CF; otherwise, that flag is cleared.
+    //
+    // As the "operating system", we choose a time-limit of zero. The point of
+    // TPAUSE/UMWAIT is to make spin-wait loops more efficient without yielding
+    // to the operating system scheduler and triggering a full context switch.
+    // But because we serialize all execution to a single physical core, no
+    // progress will ever be made without yielding, and of course we've already
+    // paid the cost of a context switch and then some.
+    r.set_flags((r.flags() & ~X86_ALL_ARITH_FLAGS) | X86_CF_FLAG);
   }
 
   r.set_ip(r.ip() + len);
   t->set_regs(r);
+  t->record_event(Event::instruction_trap());
 
-  t->push_event(Event::instruction_trap());
+  if (should_retry_patch) {
+    LOG(debug) << "Retrying deferred syscall patching";
+    should_retry_patch = false;
+    if (t->vm()->monkeypatcher().try_patch_trapping_instruction(t, len, false, should_retry_patch)) {
+      // Instruction was patched. Emit event.
+      auto ev = Event::patch_syscall();
+      ev.PatchSyscall().patch_after_syscall = true;
+      t->record_event(ev);
+    }
+    ASSERT(t, !should_retry_patch);
+  }
+
+  t->push_event(Event::noop());
   return true;
 }
 
@@ -146,105 +202,63 @@ static bool try_grow_map(RecordTask* t, siginfo_t* si) {
   // Use kernel_abi to avoid odd inconsistencies between distros
   auto arch_si = reinterpret_cast<NativeArch::siginfo_t*>(si);
   auto addr = arch_si->_sifields._sigfault.si_addr_.rptr();
-
-  if (t->vm()->has_mapping(addr)) {
-    LOG(debug) << "try_grow_map " << addr << ": address already mapped";
-    return false;
+  if (t->try_grow_map(addr)) {
+    t->push_event(Event::noop());
+    return true;
   }
-  auto maps = t->vm()->maps_starting_at(floor_page_size(addr));
-  auto it = maps.begin();
-  if (it == maps.end()) {
-    LOG(debug) << "try_grow_map " << addr << ": no later map to grow downward";
-    return false;
-  }
-  if (!(it->map.flags() & MAP_GROWSDOWN)) {
-    LOG(debug) << "try_grow_map " << addr << ": map is not MAP_GROWSDOWN ("
-               << it->map << ")";
-    return false;
-  }
-  if (addr >= page_size() && t->vm()->has_mapping(addr - page_size())) {
-    LOG(debug) << "try_grow_map " << addr << ": address would be in guard page";
-    return false;
-  }
-  remote_ptr<void> limit_bottom;
-#if defined (__i386__)
-  struct rlimit stack_limit;
-  int ret = prlimit(t->tid, RLIMIT_STACK, NULL, &stack_limit);
-#else
-  struct rlimit64 stack_limit;
-  int ret = syscall(__NR_prlimit64, t->tid, RLIMIT_STACK, (void*)0, &stack_limit);
-#endif
-  if (ret >= 0 && stack_limit.rlim_cur != RLIM_INFINITY) {
-    limit_bottom = ceil_page_size(it->map.end() - stack_limit.rlim_cur);
-    if (limit_bottom > addr) {
-      LOG(debug) << "try_grow_map " << addr << ": RLIMIT_STACK exceeded";
-      return false;
-    }
-  }
-
-  // Try to grow by 64K at a time to reduce signal frequency.
-  auto new_start = floor_page_size(addr);
-  static const uintptr_t grow_size = 0x10000;
-  if (it->map.start().as_int() >= grow_size) {
-    auto possible_new_start = std::max(
-        limit_bottom, std::min(new_start, it->map.start() - grow_size));
-    // Ensure that no mapping exists between possible_new_start - page_size()
-    // and new_start. If there is, possible_new_start is not valid, in which
-    // case we just abandon the optimization.
-    if (possible_new_start >= page_size() &&
-        !t->vm()->has_mapping(possible_new_start - page_size()) &&
-        t->vm()->maps_starting_at(possible_new_start - page_size())
-                .begin()
-                ->map.start() == it->map.start()) {
-      new_start = possible_new_start;
-    }
-  }
-  LOG(debug) << "try_grow_map " << addr << ": trying to grow map " << it->map;
-
-  {
-    AutoRemoteSyscalls remote(t, AutoRemoteSyscalls::DISABLE_MEMORY_PARAMS);
-    remote.infallible_mmap_syscall_if_alive(
-        new_start, it->map.start() - new_start, it->map.prot(),
-        (it->map.flags() & ~MAP_GROWSDOWN) | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-  }
-
-  KernelMapping km =
-      t->vm()->map(t, new_start, it->map.start() - new_start, it->map.prot(),
-                   it->map.flags() | MAP_ANONYMOUS, 0, string(),
-                   KernelMapping::NO_DEVICE, KernelMapping::NO_INODE);
-  t->trace_writer().write_mapped_region(t, km, km.fake_stat(), km.fsname(), vector<TraceRemoteFd>());
-  // No need to flush syscallbuf here. It's safe to map these pages "early"
-  // before they're really needed.
-  t->record_event(Event::grow_map(), RecordTask::DONT_FLUSH_SYSCALLBUF);
-  t->push_event(Event::noop());
-  LOG(debug) << "try_grow_map " << addr << ": extended map "
-             << t->vm()->mapping_of(addr).map;
-  return true;
+  return false;
 }
 
 void disarm_desched_event(RecordTask* t) {
-  if (t->desched_fd.is_open() &&
-      ioctl(t->desched_fd, PERF_EVENT_IOC_DISABLE, 0)) {
+  ScopedFd& fd = t->desched_fd.tracee_fd();
+  if (fd.is_open() && ioctl(fd, PERF_EVENT_IOC_DISABLE, 0)) {
     FATAL() << "Failed to disarm desched event";
   }
 }
 
 void arm_desched_event(RecordTask* t) {
-  if (t->desched_fd.is_open() &&
-      ioctl(t->desched_fd, PERF_EVENT_IOC_ENABLE, 0)) {
+  ScopedFd& fd = t->desched_fd.tracee_fd();
+  if (fd.is_open() && ioctl(fd, PERF_EVENT_IOC_ENABLE, 0)) {
     FATAL() << "Failed to arm desched event";
   }
 }
 
+bool desched_event_armed(RecordTask *t) {
+  if (t->syscallbuf_child == nullptr) {
+    return false;
+  }
+  bool ok = true;
+  bool is_armed = t->read_mem(
+    REMOTE_PTR_FIELD(t->syscallbuf_child, desched_signal_may_be_relevant), &ok);
+  if (!ok) {
+    // If we can't read this (perhaps syscallbuf isn't actually mapped), it's not armed
+    return false;
+  }
+  return is_armed;
+}
+
 template <typename Arch>
 static remote_code_ptr get_stub_scratch_1_arch(RecordTask* t) {
-  auto locals = t->read_mem(AddressSpace::preload_thread_locals_start()
-                                .cast<preload_thread_locals<Arch>>());
-  return locals.stub_scratch_1.rptr().as_int();
+  auto remote_locals = AddressSpace::preload_thread_locals_start()
+    .cast<preload_thread_locals<Arch>>();
+  auto remote_stub_scratch_1 = REMOTE_PTR_FIELD(remote_locals, stub_scratch_1);
+  return t->read_mem(remote_stub_scratch_1).rptr().as_int();
 }
 
 static remote_code_ptr get_stub_scratch_1(RecordTask* t) {
   RR_ARCH_FUNCTION(get_stub_scratch_1_arch, t->arch(), t);
+}
+
+template <typename Arch>
+static void get_stub_scratch_2_arch(RecordTask* t, void *buff, size_t sz) {
+  auto remote_locals = AddressSpace::preload_thread_locals_start()
+    .cast<preload_thread_locals<Arch>>();
+  auto remote_stub_scratch_2 = REMOTE_PTR_FIELD(remote_locals, stub_scratch_2);
+  t->read_bytes_helper(remote_stub_scratch_2, sz, buff);
+}
+
+static void get_stub_scratch_2(RecordTask* t, void *buff, size_t sz) {
+  RR_ARCH_FUNCTION(get_stub_scratch_2_arch, t->arch(), t, buff, sz);
 }
 
 /**
@@ -260,10 +274,43 @@ bool handle_syscallbuf_breakpoint(RecordTask* t) {
   if (t->is_at_syscallbuf_final_instruction_breakpoint()) {
     LOG(debug) << "Reached final syscallbuf instruction, singlestepping to "
                   "enable signal dispatch";
-    // This is a single instruction that jumps to the location stored in
-    // preload_thread_locals::stub_scratch_1. Emulate it.
+    // Emulate the effect of the return from syscallbuf.
+    // On x86, this is a single instruction that jumps to the location stored in
+    // preload_thread_locals::stub_scratch_1.
+    // On aarch64, the target of the jump is an instruction that restores
+    // x15 and x30 and then jump back to the syscall.
+    // To minimize the surprise to the tracee if we decide to deliver a signal
+    // we'll emulate the register restore and return directly to the syscall site.
+    // The address in stub_scratch_1 is already the correct address for this.
+    if (t->arch() == aarch64) {
+      uint64_t x15_x30[2];
+      get_stub_scratch_2(t, x15_x30, 16);
+      Registers r = t->regs();
+      r.set_x(15, x15_x30[0]);
+      r.set_x(30, x15_x30[1]);
+      t->set_regs(r);
+      t->count_direct_jump();
+    }
     t->emulate_jump(get_stub_scratch_1(t));
 
+    restore_sighandler_if_not_default(t, SIGTRAP);
+    // Now we're back in application code so any pending stashed signals
+    // will be handled.
+    return true;
+  }
+
+  if (t->is_at_syscallstub_exit_breakpoint()) {
+    LOG(debug) << "Reached syscallstub exit instruction, singlestepping to "
+                  "enable signal dispatch";
+    ASSERT(t, t->arch() == aarch64 && t->syscallstub_exit_breakpoint);
+    auto retaddr_addr = t->syscallstub_exit_breakpoint.to_data_ptr<uint8_t>() + 3 * 4;
+    uint64_t retaddr;
+    t->read_bytes_helper(retaddr_addr, sizeof(retaddr), &retaddr);
+    Registers r = t->regs();
+    r.set_ip(retaddr);
+    t->set_regs(r);
+    t->count_direct_jump();
+    t->syscallstub_exit_breakpoint = nullptr;
     restore_sighandler_if_not_default(t, SIGTRAP);
     // Now we're back in application code so any pending stashed signals
     // will be handled.
@@ -289,8 +336,7 @@ bool handle_syscallbuf_breakpoint(RecordTask* t) {
   // We're at an untraced-syscall entry point.
   // To allow an AutoRemoteSyscall, we need to make sure desched signals are
   // disarmed (and rearmed afterward).
-  bool armed_desched_event = t->read_mem(
-      REMOTE_PTR_FIELD(t->syscallbuf_child, desched_signal_may_be_relevant));
+  bool armed_desched_event = desched_event_armed(t);
   if (armed_desched_event) {
     disarm_desched_event(t);
   }
@@ -342,9 +388,7 @@ static void handle_desched_event(RecordTask* t) {
    * the desched_signal_may_be_relevant was set by the outermost syscallbuf
    * invocation.
    */
-  if (!t->read_mem(REMOTE_PTR_FIELD(t->syscallbuf_child,
-                                    desched_signal_may_be_relevant)) ||
-      t->running_inside_desched()) {
+  if (!desched_event_armed(t) || t->running_inside_desched()) {
     LOG(debug) << "  (not entering may-block syscall; resuming)";
     /* We have to disarm the event just in case the tracee
      * has cleared the relevancy flag, but not yet
@@ -395,7 +439,7 @@ static void handle_desched_event(RecordTask* t) {
    *  o parent is notified and sees counter value i+1
    *  o parent stops delivery of first signal and disarms
    *    counter
-   *  o second signal dequeued and delivered, notififying parent
+   *  o second signal dequeued and delivered, notifying parent
    *    (counter is disarmed now, so no pseudo-desched possible
    *    here)
    *  o parent notifiedand sees counter value i+1 again
@@ -414,6 +458,47 @@ static void handle_desched_event(RecordTask* t) {
    * That may be a kernel bug, but we handle it by just
    * continuing until we we continue past the arm-desched
    * syscall *and* stop seeing signals. */
+
+  const auto untraced_record_only_entry =
+    uintptr_t(RR_PAGE_SYSCALL_UNTRACED_RECORDING_ONLY);
+  auto syscall_entry_ip = t->ip().decrement_by_syscall_insn_length(t->arch());
+  if (syscall_entry_ip == remote_code_ptr(untraced_record_only_entry) &&
+      t->regs().syscall_result_signed() == -EFAULT) {
+    intptr_t syscallno;
+    if (t->arch() == aarch64) {
+      // Untraced syscall, we may not have set original_syscallno for this on aarch64.
+      syscallno = t->regs().syscallno();
+    } else {
+      // On x86, syscall no is overwritten by return value.
+      ASSERT(t, is_x86ish(t->arch()));
+      syscallno = t->regs().original_syscallno();
+    }
+    if (syscallno == syscall_number_for_getsockopt(t->arch())) {
+      // We've observed interrupted getsockopt syscalls returning `EFAULT`
+      // rather than the normal ERESTART*.
+      // This is a kernel bug caused by CONFIG_BPFILTER_UMH.
+      // Try to reduce the effect caused by rr generated signals
+      // by manually restarting the syscall
+      // (since the previous syscall returned EFAULT
+      //  we would in the worst case just get another EFAULT).
+      // Note that setting syscall result to ERESTART* wouldn't work on aarch64
+      // if the arg1 has been overwritten by AutoRemoteSyscalls.
+      auto r = t->regs();
+      r.set_ip(syscall_entry_ip);
+      if (t->arch() == aarch64) {
+        // On AArch64, we need to restore arg1 from the stack argument from syscallbuf.
+        auto orig_arg1_ptr = r.sp() + sizeof(long);
+        auto orig_arg1 = t->read_mem(orig_arg1_ptr.cast<long>());
+        r.set_arg1(orig_arg1);
+      } else {
+        ASSERT(t, is_x86ish(t->arch()));
+        // On x86, we need to restore syscall number
+        r.set_syscallno(syscallno);
+      }
+      t->set_regs(r);
+    }
+  }
+
   while (true) {
     // Prevent further desched notifications from firing
     // while we're advancing the tracee.  We're going to
@@ -423,7 +508,16 @@ static void handle_desched_event(RecordTask* t) {
     // syscall may have re-armed the event.
     disarm_desched_event(t);
 
-    t->resume_execution(RESUME_SYSCALL, RESUME_WAIT, RESUME_UNLIMITED_TICKS);
+    // See RRCALL_KILL_AFTER_DESCHED_STOP_WAIT.
+    t->in_desched_handling = true;
+    bool ok = t->resume_execution(RESUME_SYSCALL, RESUME_WAIT_NO_EXIT,
+                                  RESUME_UNLIMITED_TICKS);
+    t->in_desched_handling = false;
+    if (!ok) {
+      LOG(debug) << "  (got exit, bailing out)";
+      t->push_event(Event::noop());
+      return;
+    }
 
     if (t->status().is_syscall()) {
       t->apply_syscall_entry_regs();
@@ -441,12 +535,6 @@ static void handle_desched_event(RecordTask* t) {
       // untraced syscall, but it could be generated by a tracee's
       // seccomp filter.
       break;
-    }
-    if (t->ptrace_event() == PTRACE_EVENT_EXIT) {
-      LOG(debug)
-          << "  (got exit, bailing out)";
-      t->push_event(Event::noop());
-      return;
     }
 
     // Completely ignore spurious desched signals and
@@ -549,6 +637,11 @@ static bool is_safe_to_deliver_signal(RecordTask* t, siginfo_t* si) {
     return true;
   }
 
+  // Note that this will never fire on aarch64 in a signal stop
+  // since the ip has been moved to the syscall entry.
+  // We will catch it in the traced_syscall_entry case below.
+  // We will miss the exit for rrcall_notify_syscall_hook_exit
+  // but that should not be a big problem.
   if (t->is_in_traced_syscall()) {
     LOG(debug) << "Safe to deliver signal at " << t->ip()
                << " because in traced syscall";
@@ -570,6 +663,8 @@ static bool is_safe_to_deliver_signal(RecordTask* t, siginfo_t* si) {
     return true;
   }
 
+  // On aarch64, the untraced syscall here include both entry and exit
+  // if we are at a signal stop.
   if (t->is_in_untraced_syscall() && t->desched_rec()) {
     // Untraced syscalls always use the architecture of the process
     LOG(debug) << "Safe to deliver signal at " << t->ip()
@@ -661,9 +756,7 @@ SignalHandled handle_signal(RecordTask* t, siginfo_t* si,
       return DEFER_SIGNAL;
     }
 
-    if (!t->set_siginfo_for_synthetic_SIGCHLD(si)) {
-      return DEFER_SIGNAL;
-    }
+    t->set_siginfo_for_synthetic_SIGCHLD(si);
 
     if (sig == PerfCounters::TIME_SLICE_SIGNAL) {
       t->push_event(Event::sched());

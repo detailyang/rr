@@ -16,6 +16,7 @@
 #include "RecordCommand.h"
 #include "ReplayCommand.h"
 #include "core.h"
+#include "extra_version_string.h"
 #include "log.h"
 #include "util.h"
 
@@ -48,7 +49,7 @@ void assert_prerequisites(bool use_syscall_buffer) {
   }
 }
 
-void print_version(FILE* out) { fprintf(out, "rr version %s\n", RR_VERSION); }
+void print_version(FILE* out) { fprintf(out, "rr version %s %s\n", RR_VERSION, EXTRA_VERSION_STRING); }
 
 void print_global_options(FILE* out) {
   fputs(
@@ -127,6 +128,7 @@ bool parse_global_option(std::vector<std::string>& args) {
     { 1, "disable-ptrace-exit-events", NO_PARAMETER },
     { 2, "resource-path", HAS_PARAMETER },
     { 3, "log", HAS_PARAMETER },
+    { 4, "non-interactive", NO_PARAMETER },
     { 'A', "microarch", HAS_PARAMETER },
     { 'C', "checksum", HAS_PARAMETER },
     { 'D', "dump-on", HAS_PARAMETER },
@@ -161,6 +163,9 @@ bool parse_global_option(std::vector<std::string>& args) {
       break;
     case 3:
       apply_log_spec(opt.value.c_str());
+      break;
+    case 4:
+      flags.non_interactive = true;
       break;
     case 'A':
       flags.forced_uarch = opt.value;

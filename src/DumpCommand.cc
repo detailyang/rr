@@ -107,20 +107,30 @@ static bool parse_dump_arg(vector<string>& args, DumpFlags& flags) {
 
 static void dump_syscallbuf_data(TraceReader& trace, FILE* out,
                                  const TraceFrame& frame,
-                                 bool dump_raw) {
+                                 const DumpFlags& flags) {
   if (frame.event().type() != EV_SYSCALLBUF_FLUSH) {
     return;
   }
-  auto buf = trace.read_raw_data();
-  size_t bytes_remaining = buf.data.size() - sizeof(struct syscallbuf_hdr);
+  TraceReader::RawData buf;
+  bool ok = trace.read_raw_data_for_frame(buf);
+  if (!ok) {
+    FATAL() << "Can't read raw-data record for syscallbuf";
+  }
+  size_t bytes_remaining = buf.data.size() - trace.syscallbuf_hdr_size();
   auto flush_hdr = reinterpret_cast<const syscallbuf_hdr*>(buf.data.data());
   if (flush_hdr->num_rec_bytes > bytes_remaining) {
-    fprintf(stderr, "Malformed trace file (bad recorded-bytes count)\n");
-    notifying_abort();
+    CLEAN_FATAL() << "Malformed trace file (bad recorded-bytes count)";
+  }
+  if (flags.raw_dump) {
+    fprintf(out, "  ");
+    for (unsigned long i = 0; i < sizeof(syscallbuf_hdr); ++i) {
+      fprintf(out, "%2.2x", *(buf.data.data() + (uintptr_t)i));
+    }
+    fprintf(out, "\n");
   }
   bytes_remaining = flush_hdr->num_rec_bytes;
 
-  auto record_ptr = reinterpret_cast<const uint8_t*>(flush_hdr + 1);
+  auto record_ptr = reinterpret_cast<const uint8_t*>(flush_hdr) + trace.syscallbuf_hdr_size();
   auto end_ptr = record_ptr + bytes_remaining;
   while (record_ptr < end_ptr) {
     auto record = reinterpret_cast<const struct syscallbuf_record*>(record_ptr);
@@ -130,7 +140,7 @@ static void dump_syscallbuf_data(TraceReader& trace, FILE* out,
             (long)record->ret, (long)record->size,
             record->desched ? ", desched:1" : "",
             record->replay_assist ? ", replay_assist:1" : "");
-    if (dump_raw) {
+    if (flags.raw_dump) {
       fprintf(out, "  ");
       for (unsigned long i = 0; i < record->size; ++i) {
         fprintf(out, "%2.2x", *(record_ptr + (uintptr_t)i));
@@ -138,10 +148,22 @@ static void dump_syscallbuf_data(TraceReader& trace, FILE* out,
       fprintf(out, "\n");
     }
     if (record->size < sizeof(*record)) {
-      fprintf(stderr, "Malformed trace file (bad record size)\n");
-      notifying_abort();
+      CLEAN_FATAL() << "Malformed trace file (bad record size)";
     }
     record_ptr += stored_record_size(record->size);
+  }
+  if (flags.dump_mmaps) {
+    for (auto& record : frame.event().SyscallbufFlush().mprotect_records) {
+      fprintf(out, "  { start:%p, size:%" PRIx64 ", prot:'%s' }\n",
+              (void*)record.start, record.size, prot_flags_string(record.prot).c_str());
+      if (flags.raw_dump) {
+        fprintf(out, "  ");
+        for (unsigned long i = 0; i < sizeof(record); ++i) {
+          fprintf(out, "%2.2x", *(reinterpret_cast<const uint8_t*>(&record) + (uintptr_t)i));
+        }
+        fprintf(out, "\n");
+      }
+    }
   }
 }
 
@@ -225,7 +247,7 @@ static void dump_task_event(FILE* out, const TraceTaskEvent& event) {
  */
 static void dump_events_matching(TraceReader& trace, const DumpFlags& flags,
                                  FILE* out, const string* spec,
-                                 const unordered_map<FrameTime, TraceTaskEvent>& task_events) {
+                                 const unordered_multimap<FrameTime, TraceTaskEvent>& task_events) {
 
   uint32_t start = 0, end = numeric_limits<uint32_t>::max();
   bool only_end = false;
@@ -244,7 +266,7 @@ static void dump_events_matching(TraceReader& trace, const DumpFlags& flags,
   bool process_raw_data =
       flags.dump_syscallbuf || flags.dump_recorded_data_metadata;
   while (!trace.at_end()) {
-    auto frame = trace.read_frame();
+    auto frame = trace.read_frame(start);
     if (end < frame.time()) {
       return;
     }
@@ -257,11 +279,11 @@ static void dump_events_matching(TraceReader& trace, const DumpFlags& flags,
         frame.dump(out);
       }
       if (flags.dump_syscallbuf) {
-        dump_syscallbuf_data(trace, out, frame, flags.raw_dump);
+        dump_syscallbuf_data(trace, out, frame, flags);
       }
       if (flags.dump_task_events) {
-        auto it = task_events.find(frame.time());
-        if (it != task_events.end()) {
+        auto range = task_events.equal_range(frame.time());
+        for (auto it = range.first; it != range.second; ++it) {
           dump_task_event(out, it->second);
         }
       }
@@ -318,6 +340,7 @@ static void dump_events_matching(TraceReader& trace, const DumpFlags& flags,
               if (!first) {
                 fputs(", ", out);
               }
+              first = false;
               fprintf(out, "%p-%p", (void*)h.offset, (void*)(h.offset + h.size));
             }
             fputs("]", out);
@@ -365,7 +388,7 @@ void dump(const string& trace_dir, const DumpFlags& flags,
                  "eax ebx ecx edx esi edi ebp orig_eax esp eip eflags\n");
   }
 
-  unordered_map<FrameTime, TraceTaskEvent> task_events;
+  unordered_multimap<FrameTime, TraceTaskEvent> task_events;
   FrameTime last_time = 0;
   while (true) {
     FrameTime time;
